@@ -137,7 +137,16 @@ def main():
     threading.Thread(target=self_ping, daemon=True).start()
 
     print("🚀 Bot starting...")
-    application.run_polling()
+
+    # ✅ Render အတွက် အရေးကြီးသော ပြင်ဆင်မှု (Event Loop Fix)
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
