@@ -11,7 +11,6 @@ from telegram.ext import (
     ContextTypes, filters
 )
 import sec
-import random
 
 # ---------------- CONFIG ----------------
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -19,20 +18,13 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 123456789))
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("DB_NAME", "gemini_ai_bot_db")
 
-# ✅ GEMINI KEY ROTATION
-GEMINI_KEYS = [
-    v for k, v in os.environ.items()
-    if k.startswith("KEY") and v.strip()
-]
-
 # ---------------- DATABASE ----------------
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 users_col = db["users"]
 
-# Link collections & keys to sec.py
+# Link collections to sec.py
 sec.users_col = users_col
-sec.GEMINI_KEYS = GEMINI_KEYS
 
 # ---------------- USER SYNC ----------------
 async def sync_user(update: Update):
@@ -55,15 +47,18 @@ async def sync_user(update: Update):
 # ---------------- COMMANDS ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sync_user(update)
-    await update.message.reply_text("🤖 AI Bot Ready! စာရိုက်ပြီး စကားပြောနိုင်ပါပြီ။")
+    try:
+        await update.message.reply_text("🤖 AI Bot Ready! စာရိုက်ပြီး စကားပြောနိုင်ပါပြီ။")
+    except:
+        pass
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = users_col.find_one({"user_id": user_id}) or {}
     personality = user_data.get("personality", "Gemini AI Bot")
-    
+
     display_name = personality if len(personality) < 40 else "Custom AI Bot"
-    
+
     help_text = (
         f"🤖 *{display_name} Help*\n\n"
         "• /start - Bot စတင်ရန်\n"
@@ -71,31 +66,41 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /delete_all - Chat history နှင့် စရိုက်အားလုံးဖျက်ရန်\n"
         "• စာရိုက်ပို့ရုံဖြင့် AI နှင့် စကားပြောနိုင်ပါသည်။"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+    try:
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+    except:
+        pass
 
 async def delete_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
         users_col.delete_one({"user_id": user_id})
         await update.message.reply_text("✅ သင့် data အားလုံးကို reset လုပ်ပြီးပါပြီ။")
-    except Exception:
-        await update.message.reply_text("❌ Reset လုပ်ရတာ အဆင်မပြေပါ။")
+    except Exception as e:
+        print(f"❌ Delete Error: {e}")
 
 # ---------------- AI HANDLER ----------------
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+
+    # ✅ DM only
     if update.effective_chat.type != "private":
         return
 
     await sync_user(update)
+
     try:
         await sec.handle_ai(update, context)
     except Exception as e:
         print(f"❌ AI Error: {e}")
-        await update.message.reply_text("❌ AI Error occurred.")
+        try:
+            await update.message.reply_text("❌ AI Error occurred.")
+        except:
+            pass
 
-# ---------------- WEB SERVER & SELF-PING ----------------
+# ---------------- WEB SERVER ----------------
 app_flask = Flask(__name__)
 
 @app_flask.route("/")
@@ -103,7 +108,10 @@ def home():
     return "Bot is running."
 
 def run_flask():
-    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    try:
+        app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    except Exception as e:
+        print(f"❌ Flask Error: {e}")
 
 def self_ping():
     import requests
@@ -112,40 +120,39 @@ def self_ping():
         if url:
             try:
                 requests.get(url, timeout=10)
-            except:
-                pass
-        time.sleep(300)  # 5 minutes
+            except Exception as e:
+                print(f"❌ Ping Error: {e}")
+        time.sleep(300)
 
 # ---------------- MAIN ----------------
 def main():
-    # Setup DB index
-    users_col.create_index("user_id", unique=True)
-    
-    # Telegram Bot Application
+    # ✅ DB index
+    try:
+        users_col.create_index("user_id", unique=True)
+    except Exception as e:
+        print(f"❌ Index Error: {e}")
+
     application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
-    
-    # Command Handlers
+
+    # Handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("delete_all", delete_all_cmd))
-    
-    # Message Handler for AI
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_handler))
 
-    # Run Flask & Self-Ping in background threads
+    # Background threads
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
 
     print("🚀 Bot starting...")
 
-    # ✅ Render အတွက် အရေးကြီးသော ပြင်ဆင်မှု (Event Loop Fix)
-    import asyncio
+    # ✅ Render Event Loop Fix
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
     application.run_polling(close_loop=False)
 
 if __name__ == "__main__":
