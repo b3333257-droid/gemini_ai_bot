@@ -54,7 +54,7 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             )
 
             model = genai.GenerativeModel(
-                "model/gemini-1.5-flash",
+                "models/gemini-1.5-flash",
                 system_instruction=system_text
             )
 
