@@ -1,38 +1,50 @@
 # sec.py
 import os
-import random
 from datetime import datetime
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ContextTypes
+from telegram.constants import ChatAction  # ✅ ADD THIS
 
 # ---------------- DATABASE ----------------
 users_col = None
 GEMINI_KEYS = []
 
+# ---------------- KEY LOADER ----------------
+def update_keys():
+    global GEMINI_KEYS
+    temp_keys = []
+    for i in range(1, 11):
+        k = os.environ.get(f"KEY{i}")
+        if k and k.strip():
+            temp_keys.append(k.strip())
+    GEMINI_KEYS = temp_keys
+    print(f"🔑 Loaded {len(GEMINI_KEYS)} Gemini Keys.")
+
 # ---------------- GEMINI RESPONSE ----------------
 async def get_gemini_response(prompt: str, history: list, personality: str):
-    if not GEMINI_KEYS:
-        return "❌ No API Keys found."
+    update_keys()
 
-    # ✅ Clean history for Gemini SDK (parts must be list of strings)
+    if not GEMINI_KEYS:
+        return "❌ No API Keys found in Environment Variables."
+
+    # Clean history
     cleaned_history = []
     for h in history:
         try:
             parts = h.get("parts", "")
             if isinstance(parts, list):
                 parts = parts[0] if parts else ""
-            # Always wrap as list
             cleaned_history.append({
                 "role": h.get("role", "user"),
-                "parts": [parts]
+                "parts": [str(parts)]
             })
-        except Exception:
+        except:
             continue
 
-    for _ in range(len(GEMINI_KEYS)):
+    # Loop keys
+    for key in GEMINI_KEYS:
         try:
-            key = random.choice(GEMINI_KEYS)
             genai.configure(api_key=key)
 
             system_text = (
@@ -52,12 +64,18 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             return response.text.strip()
 
         except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "quota" in err or "rate" in err:
+            err_msg = str(e).lower()
+
+            if any(x in err_msg for x in [
+                "429", "quota", "limit", "rate",
+                "key_invalid", "api_key_invalid"
+            ]):
+                print(f"⚠️ Key failed → next ({err_msg[:60]})")
                 continue
+
             return f"❌ AI Error: {e}"
 
-    return "❌ All API keys are rate-limited."
+    return "❌ All API keys failed (Rate-limited or Invalid)."
 
 # ---------------- PERSONALITY DETECTOR ----------------
 def detect_personality_update(message: str):
@@ -72,9 +90,17 @@ def detect_personality_update(message: str):
 async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message.text
-
     if not user or not message:
         return
+
+    # ✅ SHOW "typing..." STATUS
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_message.chat_id,
+            action=ChatAction.TYPING
+        )
+    except:
+        pass
 
     user_id = user.id
 
@@ -99,7 +125,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------------- GET AI RESPONSE ----------------
     reply = await get_gemini_response(message, history, personality)
 
-    # ✅ send first (important)
+    # ---------------- SEND MESSAGE ----------------
     sent = False
     try:
         await update.message.reply_text(reply)
@@ -107,17 +133,9 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"❌ Telegram Send Error: {e}")
 
-    # ✅ save history only if sent success
+    # ---------------- SAVE HISTORY ----------------
     if sent:
         try:
-            # Optional: ensure roles alternate (user, model)
-            if history and history[-1].get("role") == "user":
-                # last message is user, next model, ok
-                pass
-            elif history and history[-1].get("role") == "model":
-                # last is model, ok
-                pass
-
             users_col.update_one(
                 {"user_id": user_id},
                 {
