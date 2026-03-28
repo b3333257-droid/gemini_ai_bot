@@ -66,9 +66,14 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
 
         except Exception as e:
             err = str(e).lower()
+
+            # ✅ Only skip rate limit / quota
             if any(x in err for x in ["429", "quota", "rate", "limit"]):
+                print("⚠️ Rate limit → next key")
                 continue
-            return f"❌ AI Error: {e}"
+
+            # ✅ Show real error (debug)
+            return f"❌ AI Error Detail: {e}"
 
     return "❌ All API keys failed."
 
@@ -76,11 +81,9 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
 def detect_personality_update(message: str):
     msg = message.strip()
 
-    # ❌ avoid normal conversation triggers
     if len(msg) > 80:
         return None
 
-    # ✅ strong intent keywords (more strict)
     triggers = [
         "မင်းနာမည်",
         "နာမည်ကို",
@@ -121,7 +124,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = user_data.get("chat_history", [])
     personality = user_data.get("personality", "")
 
-    # personality update (smarter)
+    # personality update
     new_personality = detect_personality_update(message)
     if new_personality:
         personality = new_personality
