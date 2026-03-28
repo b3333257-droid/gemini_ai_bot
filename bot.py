@@ -1,3 +1,4 @@
+# bot.py
 import asyncio
 import os
 import threading
@@ -23,7 +24,7 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 users_col = db["users"]
 
-# Link collections to sec.py
+# Link DB to sec.py
 sec.users_col = users_col
 
 # ---------------- USER SYNC ----------------
@@ -72,20 +73,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-async def delete_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        users_col.delete_one({"user_id": user_id})
-        await update.message.reply_text("✅ သင့် data အားလုံးကို reset လုပ်ပြီးပါပြီ။")
-    except Exception as e:
-        print(f"❌ Delete Error: {e}")
-
 # ---------------- AI HANDLER ----------------
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    # ✅ DM only
     if update.effective_chat.type != "private":
         return
 
@@ -126,6 +118,9 @@ def self_ping():
 
 # ---------------- MAIN ----------------
 def main():
+    # ✅ Load Gemini Keys
+    sec.update_keys()
+
     # ✅ DB index
     try:
         users_col.create_index("user_id", unique=True)
@@ -137,10 +132,10 @@ def main():
     # Handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("delete_all", delete_all_cmd))
+    application.add_handler(CommandHandler("delete_all", sec.delete_all))  # ✅ use sec.py
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_handler))
 
-    # Background threads
+    # Background
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
 
