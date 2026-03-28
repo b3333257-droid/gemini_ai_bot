@@ -4,7 +4,7 @@ from datetime import datetime
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ContextTypes
-from telegram.constants import ChatAction  # ✅ ADD THIS
+from telegram.constants import ChatAction
 
 # ---------------- DATABASE ----------------
 users_col = None
@@ -21,28 +21,29 @@ def update_keys():
     GEMINI_KEYS = temp_keys
     print(f"🔑 Loaded {len(GEMINI_KEYS)} Gemini Keys.")
 
+# ---------------- ROLE SANITIZER ----------------
+def fix_role(role: str):
+    return "model" if role == "model" else "user"
+
 # ---------------- GEMINI RESPONSE ----------------
 async def get_gemini_response(prompt: str, history: list, personality: str):
-    update_keys()
-
     if not GEMINI_KEYS:
-        return "❌ No API Keys found in Environment Variables."
+        return "❌ No API Keys found."
 
-    # Clean history
     cleaned_history = []
     for h in history:
         try:
-            parts = h.get("parts", "")
-            if isinstance(parts, list):
-                parts = parts[0] if parts else ""
+            raw_parts = h.get("parts", "")
+            if isinstance(raw_parts, list):
+                raw_parts = raw_parts[0] if raw_parts else ""
+
             cleaned_history.append({
-                "role": h.get("role", "user"),
-                "parts": [str(parts)]
+                "role": fix_role(h.get("role")),
+                "parts": [{"text": str(raw_parts)}]
             })
         except:
             continue
 
-    # Loop keys
     for key in GEMINI_KEYS:
         try:
             genai.configure(api_key=key)
@@ -54,7 +55,7 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             )
 
             model = genai.GenerativeModel(
-                "models/gemini-1.5-flash",
+                "gemini-1.5-flash",
                 system_instruction=system_text
             )
 
@@ -64,25 +65,35 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             return response.text.strip()
 
         except Exception as e:
-            err_msg = str(e).lower()
-
-            if any(x in err_msg for x in [
-                "429", "quota", "limit", "rate",
-                "key_invalid", "api_key_invalid"
-            ]):
-                print(f"⚠️ Key failed → next ({err_msg[:60]})")
+            err = str(e).lower()
+            if any(x in err for x in ["429", "quota", "rate", "limit"]):
                 continue
-
             return f"❌ AI Error: {e}"
 
-    return "❌ All API keys failed (Rate-limited or Invalid)."
+    return "❌ All API keys failed."
 
-# ---------------- PERSONALITY DETECTOR ----------------
+# ---------------- SMART PERSONALITY DETECTOR ----------------
 def detect_personality_update(message: str):
-    keywords = ["ပြောင်းလိုက်", "မှတ်ထား", "ခေါ်မယ်", "ဖြစ်အောင်လုပ်", "နေပါ"]
+    msg = message.strip()
 
-    if any(k in message for k in keywords):
-        return message.strip()
+    # ❌ avoid normal conversation triggers
+    if len(msg) > 80:
+        return None
+
+    # ✅ strong intent keywords (more strict)
+    triggers = [
+        "မင်းနာမည်",
+        "နာမည်ကို",
+        "မင်းကို",
+        "ခေါ်မယ်",
+        "ဖြစ်အောင်",
+        "act as",
+        "you are",
+        "your name"
+    ]
+
+    if any(t in msg.lower() for t in triggers):
+        return msg
 
     return None
 
@@ -90,10 +101,11 @@ def detect_personality_update(message: str):
 async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message.text
+
     if not user or not message:
         return
 
-    # ✅ SHOW "typing..." STATUS
+    # typing status
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_message.chat_id,
@@ -104,12 +116,12 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = user.id
 
-    # ---------------- LOAD USER DATA ----------------
+    # load data
     user_data = users_col.find_one({"user_id": user_id}) or {}
     history = user_data.get("chat_history", [])
     personality = user_data.get("personality", "")
 
-    # ---------------- PERSONALITY UPDATE ----------------
+    # personality update (smarter)
     new_personality = detect_personality_update(message)
     if new_personality:
         personality = new_personality
@@ -120,20 +132,20 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 upsert=True
             )
         except Exception as e:
-            print(f"❌ Personality Save Error: {e}")
+            print(f"❌ Personality Error: {e}")
 
-    # ---------------- GET AI RESPONSE ----------------
+    # AI response
     reply = await get_gemini_response(message, history, personality)
 
-    # ---------------- SEND MESSAGE ----------------
+    # send
     sent = False
     try:
         await update.message.reply_text(reply)
         sent = True
     except Exception as e:
-        print(f"❌ Telegram Send Error: {e}")
+        print(f"❌ Send Error: {e}")
 
-    # ---------------- SAVE HISTORY ----------------
+    # save history
     if sent:
         try:
             users_col.update_one(
@@ -155,7 +167,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 upsert=True
             )
         except Exception as e:
-            print(f"❌ History Save Error: {e}")
+            print(f"❌ History Error: {e}")
 
 # ---------------- HARD RESET ----------------
 async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,7 +177,7 @@ async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         users_col.delete_one({"user_id": user.id})
-        await update.message.reply_text("🗑️ Your data has been fully reset.")
+        await update.message.reply_text("🗑️ Reset complete.")
     except Exception as e:
         print(f"❌ Delete Error: {e}")
-        await update.message.reply_text("❌ Failed to reset data.")
+        await update.message.reply_text("❌ Reset failed.")
