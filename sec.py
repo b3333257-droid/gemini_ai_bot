@@ -28,34 +28,46 @@ def fix_role(role: str):
 # ---------------- GEMINI RESPONSE ----------------
 async def get_gemini_response(prompt: str, history: list, personality: str):
     if not GEMINI_KEYS:
-        return "❌ No API Keys found."
+        return "❌ No API Keys found in Environment Variables."
 
+    # ✅ Clean history (robust)
     cleaned_history = []
     for h in history:
         try:
-            raw_parts = h.get("parts", "")
-            if isinstance(raw_parts, list):
-                raw_parts = raw_parts[0] if raw_parts else ""
+            raw_parts = h.get("parts", [])
+            text_content = ""
 
-            cleaned_history.append({
-                "role": fix_role(h.get("role")),
-                "parts": [{"text": str(raw_parts)}]
-            })
-        except:
+            if isinstance(raw_parts, list) and len(raw_parts) > 0:
+                if isinstance(raw_parts[0], dict):
+                    text_content = raw_parts[0].get("text", "")
+                else:
+                    text_content = str(raw_parts[0])
+            else:
+                text_content = str(raw_parts)
+
+            if text_content:
+                cleaned_history.append({
+                    "role": fix_role(h.get("role")),
+                    "parts": [{"text": text_content}]
+                })
+
+        except Exception as e:
+            print(f"🛠 History Cleaning Error: {e}")
             continue
 
+    # ✅ Loop keys
     for key in GEMINI_KEYS:
         try:
-            genai.configure(api_key=key)
+            genai.configure(api_key=key, transport="rest")
 
             system_text = (
-                f"You must follow the user's latest identity request: {personality}"
+                personality
                 if personality else
                 "You are a helpful AI assistant."
             )
 
             model = genai.GenerativeModel(
-                "gemini-1.5-flash",
+                model_name="gemini-1.5-flash",
                 system_instruction=system_text
             )
 
@@ -65,17 +77,15 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             return response.text.strip()
 
         except Exception as e:
-            err = str(e).lower()
+            err_msg = str(e)
+            print(f"⚠️ Key Error: {err_msg}")
 
-            # ✅ Only skip rate limit / quota
-            if any(x in err for x in ["429", "quota", "rate", "limit"]):
-                print("⚠️ Rate limit → next key")
+            if "429" in err_msg or "quota" in err_msg.lower():
                 continue
 
-            # ✅ Show real error (debug)
-            return f"❌ AI Error Detail: {e}"
+            return f"❌ AI Error Detail: {err_msg}"
 
-    return "❌ All API keys failed."
+    return "❌ All API keys failed (Likely Quota or Region issues)."
 
 # ---------------- SMART PERSONALITY DETECTOR ----------------
 def detect_personality_update(message: str):
@@ -108,7 +118,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not message:
         return
 
-    # typing status
+    # typing
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_message.chat_id,
@@ -119,7 +129,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = user.id
 
-    # load data
+    # load
     user_data = users_col.find_one({"user_id": user_id}) or {}
     history = user_data.get("chat_history", [])
     personality = user_data.get("personality", "")
@@ -148,7 +158,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"❌ Send Error: {e}")
 
-    # save history
+    # save
     if sent:
         try:
             users_col.update_one(
