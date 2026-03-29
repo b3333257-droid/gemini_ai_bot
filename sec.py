@@ -54,20 +54,14 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
         except Exception:
             continue
 
-    # Loop keys
+    # ✅ UPDATED LOOP (with fallback)
     for key in GEMINI_KEYS:
         try:
             genai.configure(api_key=key, transport="rest")
 
-            system_text = (
-                personality
-                if personality else
-                "You are a helpful AI assistant."
-            )
-
             model = genai.GenerativeModel(
-                model_name="models/gemini-1.5-flash-latest",
-                system_instruction=system_text
+                model_name='gemini-1.5-flash',
+                system_instruction=personality if personality else "You are a helpful assistant."
             )
 
             chat = model.start_chat(history=cleaned_history)
@@ -79,6 +73,17 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             err_msg = str(e)
             print(f"⚠️ Key Error: {err_msg}")
 
+            # ✅ 404 fallback → try gemini-pro
+            if "404" in err_msg:
+                try:
+                    model = genai.GenerativeModel(model_name='gemini-pro')
+                    chat = model.start_chat(history=cleaned_history)
+                    response = chat.send_message(prompt)
+                    return response.text.strip()
+                except:
+                    continue
+
+            # ✅ quota skip
             if "429" in err_msg or "quota" in err_msg.lower():
                 continue
 
@@ -157,7 +162,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"❌ Send Error: {e}")
 
-    # ✅ FIXED HISTORY FORMAT HERE
+    # save history (✅ correct format)
     if sent:
         try:
             users_col.update_one(
