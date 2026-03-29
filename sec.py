@@ -1,5 +1,7 @@
 # sec.py
 import os
+import itertools
+import asyncio
 from datetime import datetime
 import google.generativeai as genai
 from telegram import Update
@@ -9,16 +11,20 @@ from telegram.constants import ChatAction
 # ---------------- DATABASE ----------------
 users_col = None
 GEMINI_KEYS = []
+key_cycle = None  # ✅ global key rotation iterator
 
 # ---------------- KEY LOADER ----------------
 def update_keys():
-    global GEMINI_KEYS
+    global GEMINI_KEYS, key_cycle
+
     temp_keys = []
     for i in range(1, 11):
         k = os.environ.get(f"KEY{i}")
         if k and k.strip():
             temp_keys.append(k.strip())
+
     GEMINI_KEYS = temp_keys
+    key_cycle = itertools.cycle(GEMINI_KEYS)
     print(f"🔑 Loaded {len(GEMINI_KEYS)} Gemini Keys.")
 
 # ---------------- ROLE SANITIZER ----------------
@@ -27,8 +33,14 @@ def fix_role(role: str):
 
 # ---------------- GEMINI RESPONSE ----------------
 async def get_gemini_response(prompt: str, history: list, personality: str):
+    global key_cycle
+
+    # ✅ Cold start / key_cycle check
+    if key_cycle is None:
+        update_keys()
+
     if not GEMINI_KEYS:
-        return "❌ No API Keys found in Environment Variables."
+        return "❌ No API Keys found."
 
     # Clean history
     cleaned_history = []
@@ -54,59 +66,51 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
         except Exception:
             continue
 
-    # ✅ UPDATED LOOP (with fallback)
-    for key in GEMINI_KEYS:
+    # 🔥 KEY ROTATION LOOP
+    for _ in range(len(GEMINI_KEYS)):
+        key = next(key_cycle)
         try:
+            print(f"🚀 Using key: {key[:8]}...")
             genai.configure(api_key=key, transport="rest")
 
             model = genai.GenerativeModel(
-                model_name='gemini-1.5-flash',
+                model_name="models/gemini-1.5-flash-latest",
                 system_instruction=personality if personality else "You are a helpful assistant."
             )
 
             chat = model.start_chat(history=cleaned_history)
-            response = chat.send_message(prompt)
+            response = await asyncio.to_thread(chat.send_message, prompt)
 
             return response.text.strip()
 
         except Exception as e:
             err_msg = str(e)
-            print(f"⚠️ Key Error: {err_msg}")
+            print(f"⚠️ Key Error ({key[:8]}...): {err_msg}")
 
-            # ✅ 404 fallback → try gemini-pro
-            if "404" in err_msg:
-                try:
-                    model = genai.GenerativeModel(model_name='gemini-pro')
-                    chat = model.start_chat(history=cleaned_history)
-                    response = chat.send_message(prompt)
-                    return response.text.strip()
-                except:
-                    continue
-
-            # ✅ quota skip
+            # Quota error → next key
             if "429" in err_msg or "quota" in err_msg.lower():
                 continue
 
-            return f"❌ AI Error Detail: {err_msg}"
+            # Model error → skip
+            if "404" in err_msg:
+                continue
 
-    return "❌ All API keys failed."
+            return f"❌ AI Error: {err_msg}"
+
+    return "❌ All API keys quota exceeded."
 
 # ---------------- PERSONALITY ----------------
 def detect_personality_update(message: str):
     msg = message.strip()
-
+    
     if len(msg) > 80:
         return None
 
+    # ✅ tightened triggers (explicit only)
     triggers = [
-        "မင်းနာမည်",
-        "နာမည်ကို",
-        "မင်းကို",
-        "ခေါ်မယ်",
-        "ဖြစ်အောင်",
-        "act as",
-        "you are",
-        "your name"
+        "မှတ်ထား",
+        "ပြောင်းလိုက်",
+        "set personality"
     ]
 
     if any(t in msg.lower() for t in triggers):
@@ -122,7 +126,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not message:
         return
 
-    # typing
+    # typing indicator
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_message.chat_id,
@@ -133,7 +137,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = user.id
 
-    # load
+    # load user data
     user_data = users_col.find_one({"user_id": user_id}) or {}
     history = user_data.get("chat_history", [])
     personality = user_data.get("personality", "")
@@ -151,7 +155,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"❌ Personality Error: {e}")
 
-    # AI
+    # AI reply
     reply = await get_gemini_response(message, history, personality)
 
     # send
@@ -162,7 +166,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"❌ Send Error: {e}")
 
-    # save history (✅ correct format)
+    # save history
     if sent:
         try:
             users_col.update_one(
@@ -177,9 +181,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "$slice": -20
                         }
                     },
-                    "$set": {
-                        "last_seen": datetime.utcnow()
-                    }
+                    "$set": {"last_seen": datetime.utcnow()}
                 },
                 upsert=True
             )
