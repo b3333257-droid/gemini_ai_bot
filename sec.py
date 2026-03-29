@@ -30,7 +30,7 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
     if not GEMINI_KEYS:
         return "❌ No API Keys found in Environment Variables."
 
-    # ✅ Clean history (robust)
+    # Clean history
     cleaned_history = []
     for h in history:
         try:
@@ -51,11 +51,10 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
                     "parts": [{"text": text_content}]
                 })
 
-        except Exception as e:
-            print(f"🛠 History Cleaning Error: {e}")
+        except Exception:
             continue
 
-    # ✅ Loop keys
+    # Loop keys
     for key in GEMINI_KEYS:
         try:
             genai.configure(api_key=key, transport="rest")
@@ -67,7 +66,7 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             )
 
             model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
+                model_name="models/gemini-1.5-flash",
                 system_instruction=system_text
             )
 
@@ -85,9 +84,9 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
 
             return f"❌ AI Error Detail: {err_msg}"
 
-    return "❌ All API keys failed (Likely Quota or Region issues)."
+    return "❌ All API keys failed."
 
-# ---------------- SMART PERSONALITY DETECTOR ----------------
+# ---------------- PERSONALITY ----------------
 def detect_personality_update(message: str):
     msg = message.strip()
 
@@ -147,7 +146,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"❌ Personality Error: {e}")
 
-    # AI response
+    # AI
     reply = await get_gemini_response(message, history, personality)
 
     # send
@@ -158,7 +157,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"❌ Send Error: {e}")
 
-    # save
+    # ✅ FIXED HISTORY FORMAT HERE
     if sent:
         try:
             users_col.update_one(
@@ -167,8 +166,8 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "$push": {
                         "chat_history": {
                             "$each": [
-                                {"role": "user", "parts": [message]},
-                                {"role": "model", "parts": [reply]}
+                                {"role": "user", "parts": [{"text": message}]},
+                                {"role": "model", "parts": [{"text": reply}]}
                             ],
                             "$slice": -20
                         }
@@ -182,7 +181,7 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"❌ History Error: {e}")
 
-# ---------------- HARD RESET ----------------
+# ---------------- RESET ----------------
 async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
