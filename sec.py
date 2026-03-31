@@ -218,3 +218,16 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"❌ History Save Error: {e}")
+        # ---------------- RESET ----------------
+async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    try:
+        # bot.py ကနေ လှမ်းချိတ်ထားတဲ့ users_col ကို သုံးပြီး user data ဖြတ်မယ်
+        users_col.delete_one({"user_id": user.id})
+        await update.message.reply_text("🗑️ Reset complete. Chat history နှင့် စရိုက်အားလုံး ဖျက်လိုက်ပါပြီ။")
+    except Exception as e:
+        print(f"❌ Delete Error: {e}")
+        await update.message.reply_text("❌ Reset လုပ်ရတာ အဆင်မပြေဖြစ်သွားပါတယ်။")
