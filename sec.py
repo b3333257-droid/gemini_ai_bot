@@ -9,11 +9,13 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
 # ---------------- DATABASE ----------------
+
 users_col = None
 GEMINI_KEYS = []
-key_cycle = None  # ✅ global key rotation iterator
+key_cycle = None
 
 # ---------------- KEY LOADER ----------------
+
 def update_keys():
     global GEMINI_KEYS, key_cycle
 
@@ -24,51 +26,58 @@ def update_keys():
             temp_keys.append(k.strip())
 
     GEMINI_KEYS = temp_keys
-    key_cycle = itertools.cycle(GEMINI_KEYS)
+
+    if GEMINI_KEYS:
+        key_cycle = itertools.cycle(GEMINI_KEYS)
+    else:
+        key_cycle = None
+
     print(f"🔑 Loaded {len(GEMINI_KEYS)} Gemini Keys.")
 
 # ---------------- ROLE SANITIZER ----------------
+
 def fix_role(role: str):
     return "model" if role == "model" else "user"
 
 # ---------------- GEMINI RESPONSE ----------------
+
 async def get_gemini_response(prompt: str, history: list, personality: str):
     global key_cycle
 
-    # ✅ Cold start / key_cycle check
+    # cold start
     if key_cycle is None:
         update_keys()
 
-    if not GEMINI_KEYS:
-        return "❌ No API Keys found."
+    if not GEMINI_KEYS or key_cycle is None:
+        return "❌ No API Keys found or key_cycle not initialized."
 
-    # Clean history
+    # clean history
     cleaned_history = []
     for h in history:
         try:
-            raw_parts = h.get("parts", [])
-            text_content = ""
+            role = h.get("role")
+            parts = h.get("parts")
 
-            if isinstance(raw_parts, list) and len(raw_parts) > 0:
-                if isinstance(raw_parts[0], dict):
-                    text_content = raw_parts[0].get("text", "")
-                else:
-                    text_content = str(raw_parts[0])
-            else:
-                text_content = str(raw_parts)
-
-            if text_content:
+            if (
+                role
+                and parts
+                and isinstance(parts, list)
+                and len(parts) > 0
+                and isinstance(parts[0], dict)
+                and "text" in parts[0]
+            ):
                 cleaned_history.append({
-                    "role": fix_role(h.get("role")),
-                    "parts": [{"text": text_content}]
+                    "role": fix_role(role),
+                    "parts": parts
                 })
-
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ History cleaning error: {e}")
             continue
 
-    # 🔥 KEY ROTATION LOOP
+    # key rotation
     for _ in range(len(GEMINI_KEYS)):
         key = next(key_cycle)
+
         try:
             print(f"🚀 Using key: {key[:8]}...")
             genai.configure(api_key=key, transport="rest")
@@ -87,38 +96,41 @@ async def get_gemini_response(prompt: str, history: list, personality: str):
             err_msg = str(e)
             print(f"⚠️ Key Error ({key[:8]}...): {err_msg}")
 
-            # Quota error → next key
             if "429" in err_msg or "quota" in err_msg.lower():
                 continue
 
-            # Model error → skip
-            if "404" in err_msg:
+            if "404" in err_msg or "invalid model" in err_msg.lower():
                 continue
 
             return f"❌ AI Error: {err_msg}"
 
-    return "❌ All API keys quota exceeded."
+    return "❌ All API keys quota exceeded or invalid."
 
 # ---------------- PERSONALITY ----------------
+
 def detect_personality_update(message: str):
     msg = message.strip()
-    
-    if len(msg) > 80:
-        return None
 
-    # ✅ tightened triggers (explicit only)
     triggers = [
         "မှတ်ထား",
         "ပြောင်းလိုက်",
         "set personality"
     ]
 
-    if any(t in msg.lower() for t in triggers):
-        return msg
+    for t in triggers:
+        if t in msg.lower():
+            start_index = msg.lower().find(t) + len(t)
+            personality_text = msg[start_index:].strip()
+
+            if personality_text:
+                return personality_text
+            else:
+                return t
 
     return None
 
 # ---------------- AI HANDLER ----------------
+
 async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message.text
@@ -129,11 +141,11 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # typing indicator
     try:
         await context.bot.send_chat_action(
-            chat_id=update.effective_message.chat_id,
+            chat_id=update.effective_chat.id,
             action=ChatAction.TYPING
         )
-    except:
-        pass
+    except Exception as e:
+        print(f"❌ Send chat action error: {e}")
 
     user_id = user.id
 
@@ -142,61 +154,67 @@ async def handle_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = user_data.get("chat_history", [])
     personality = user_data.get("personality", "")
 
-    # personality update
+    # ---------------- PERSONALITY UPDATE ----------------
+
     new_personality = detect_personality_update(message)
+
     if new_personality:
+        triggers = ["မှတ်ထား", "ပြောင်းလိုက်", "set personality"]
+
+        # prevent empty personality
+        if new_personality.lower().strip() in triggers:
+            await update.message.reply_text("❗ Personality text ထည့်ပါ။")
+            return
+
         personality = new_personality
+
         try:
             users_col.update_one(
                 {"user_id": user_id},
                 {"$set": {"personality": personality}},
                 upsert=True
             )
+
+            await update.message.reply_text(
+                f"✅ စရိုက်ကို ပြောင်းလဲလိုက်ပါပြီ:\n{personality}"
+            )
+
         except Exception as e:
             print(f"❌ Personality Error: {e}")
 
-    # AI reply
+        return
+
+    # ---------------- AI RESPONSE ----------------
+
     reply = await get_gemini_response(message, history, personality)
 
-    # send
-    sent = False
-    try:
-        await update.message.reply_text(reply)
-        sent = True
-    except Exception as e:
-        print(f"❌ Send Error: {e}")
-
-    # save history
-    if sent:
-        try:
-            users_col.update_one(
-                {"user_id": user_id},
-                {
-                    "$push": {
-                        "chat_history": {
-                            "$each": [
-                                {"role": "user", "parts": [{"text": message}]},
-                                {"role": "model", "parts": [{"text": reply}]}
-                            ],
-                            "$slice": -20
-                        }
-                    },
-                    "$set": {"last_seen": datetime.utcnow()}
-                },
-                upsert=True
-            )
-        except Exception as e:
-            print(f"❌ History Error: {e}")
-
-# ---------------- RESET ----------------
-async def delete_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
+    if not reply:
         return
 
     try:
-        users_col.delete_one({"user_id": user.id})
-        await update.message.reply_text("🗑️ Reset complete.")
+        await update.message.reply_text(reply)
     except Exception as e:
-        print(f"❌ Delete Error: {e}")
-        await update.message.reply_text("❌ Reset failed.")
+        print(f"❌ Reply error: {e}")
+
+    # ---------------- SAVE HISTORY ----------------
+
+    try:
+        history.append({"role": "user", "parts": [{"text": message}]})
+        history.append({"role": "model", "parts": [{"text": reply}]})
+
+        # keep last 20 messages
+        history = history[-20:]
+
+        users_col.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "chat_history": history,
+                    "updated_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+
+    except Exception as e:
+        print(f"❌ History Save Error: {e}")
