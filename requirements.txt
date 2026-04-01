@@ -1,5 +1,6 @@
-python-telegram-bot
-google-generativeai
-pymongo[srv]
-flask
-requests
+python-telegram-bot==20.8
+pymongo==4.6.1
+Flask==3.0.2
+dotenv-values==0.1.0
+requests==2.31.0
+google-generativeai==0.3.0
