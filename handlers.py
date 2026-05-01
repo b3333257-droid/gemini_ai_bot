@@ -1,10 +1,10 @@
-# handlers.py - Fully fixed (String‑based diamond, no int‑only filter, all types supported)
+# handlers.py - Final version (Burmese button text, clickable name, fixed admin buttons, migration command)
 import re
 import asyncio
 import uuid
 import logging
 import html
-from datetime import datetime
+from datetime import datetime, date
 from enum import Enum
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
@@ -16,7 +16,6 @@ import master
 logger = logging.getLogger(__name__)
 
 WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT = range(3)
-
 ADMIN_PARSE_MODE = ParseMode.HTML
 
 class OrderStatus(str, Enum):
@@ -30,7 +29,7 @@ class OrderStatus(str, Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
 
-# --- (၁) Database ကို လုံခြုံစွာ ခေါ်တဲ့ helper ---
+# ================== Helpers ==================
 def get_db(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
     if not db:
@@ -87,7 +86,6 @@ def handle_errors(handler_func):
             return ConversationHandler.END
     return wrapped
 
-# --- (၂) License Logic (Decorator အတွက်) ---
 async def check_license_logic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_user:
         return False
@@ -97,9 +95,8 @@ async def check_license_logic(update: Update, context: ContextTypes.DEFAULT_TYPE
     db = get_db(context)
     if not db:
         return False
-    admin_id = context.bot_data.get('admin_id')
-    is_licensed = await db.is_license_valid(admin_id)
-    return is_licensed
+    admin_id = get_admin_id(context)
+    return await db.is_license_valid(admin_id)
 
 def wrap_with_license(handler_func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,7 +113,6 @@ def wrap_with_license(handler_func):
 
 def validate_game_id(item_type: str, text: str) -> tuple:
     if item_type == "dia":
-        # ✅ Supports delimiters: space, dash, pipe, parentheses
         match = re.match(r"^(\d{5,20})[\s\-|()]+(\d{3,6})$", text)
         if match:
             return match.groups()
@@ -127,7 +123,6 @@ def validate_game_id(item_type: str, text: str) -> tuple:
             return (match.group(1), "")
         return None
 
-# ✅ safe_user_mention shows names when available, falls back to ID
 def safe_user_mention(user_id: int, first_name: str = None, last_name: str = None, fallback: str = "User") -> str:
     if first_name:
         name = first_name
@@ -138,7 +133,6 @@ def safe_user_mention(user_id: int, first_name: str = None, last_name: str = Non
     safe_name = escape_html(name)
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
-# 🔧 build_admin_caption now takes user details directly and shows name + ID separately
 def build_admin_caption(order: dict, user_id: int, first_name: str, last_name: str,
                         quantity: str, item_type: str, status: str) -> str:
     emoji = "💎" if item_type == "dia" else "💵"
@@ -152,14 +146,8 @@ def build_admin_caption(order: dict, user_id: int, first_name: str, last_name: s
     quantity_safe = escape_html(str(quantity))
     item_type_safe = escape_html(item_type.upper())
 
-    # User name line (clickable)
-    user_name = first_name if first_name else "Unknown"
-    if last_name:
-        user_name += " " + last_name
-    safe_user_name = escape_html(user_name)
-    name_line = f'👤 ဝယ်သူ: <a href="tg://user?id={user_id}">{safe_user_name}</a>'
-
-    # User ID line (clickable)
+    # ✅ Use safe_user_mention for clickable name
+    name_line = f"👤 ဝယ်သူ: {safe_user_mention(user_id, first_name, last_name)}"
     id_line = f'🆔 User ID: <a href="tg://user?id={user_id}">{user_id}</a>'
 
     caption = (
@@ -183,11 +171,7 @@ def sort_price_items(prices: list) -> list:
             return (1, val.lower(), val)
     return sorted(prices, key=sort_key)
 
-# ==========================================
-# 🔧 Helper for Admin Message Editing (text vs photo)
-# ==========================================
 async def edit_admin_message(query, new_caption: str, reply_markup=None):
-    """Admin message (text or photo) ကို မှန်ကန်စွာ edit လုပ်ပေးသည်။"""
     try:
         if query.message.photo:
             await query.message.edit_caption(
@@ -204,10 +188,40 @@ async def edit_admin_message(query, new_caption: str, reply_markup=None):
     except Exception as e:
         logger.error(f"Error editing admin message: {e}")
 
-# ==========================================
-# 🔰 User-Facing Handlers (License Decorator applied)
-# ==========================================
+# ================== New Helpers for Fixes ==================
+def check_refresh_limit(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Owner တစ်ယောက်ကို ၁ ရက်အတွင်း refresh ၃ ကြိမ်ထက်ပို မခွင့်ပြုပါ။"""
+    today = date.today().isoformat()
+    limits = context.bot_data.setdefault("refresh_limits", {})
+    user_record = limits.get(user_id, {"date": today, "count": 0})
+    if user_record["date"] != today:
+        user_record = {"date": today, "count": 0}
+    if user_record["count"] >= 3:
+        return False
+    user_record["count"] += 1
+    limits[user_id] = user_record
+    return True
 
+def get_remaining_time_str(expiry_date) -> str:
+    """Return human-readable remaining time string (e.g., '2လ 15ရက် ကျန်')"""
+    if not expiry_date:
+        return "N/A"
+    now = datetime.now()
+    diff = expiry_date - now
+    if diff.days < 0:
+        return "Expired"
+    months = diff.days // 30
+    days = diff.days % 30
+    return f"({months}လ {days}ရက်ကျန်)"
+
+async def _send_db_error(update: Update):
+    msg = "⚠️ ဒေတာဘေ့စ် ချိတ်ဆက်မှု မရှိပါ။ ကျေးဇူးပြု၍ ခဏနေမှ ထပ်စမ်းကြည့်ပါ။"
+    if update.message:
+        await update.message.reply_text(msg)
+    elif update.callback_query:
+        await update.callback_query.answer(msg, show_alert=True)
+
+# ================== User-Facing Handlers ==================
 @handle_errors
 @wrap_with_license
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,7 +230,6 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     admin_id = get_admin_id(context)
     is_open = await db.get_service_status()
     if not is_open and str(update.effective_user.id) != str(admin_id):
@@ -226,11 +239,12 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif update.callback_query:
             await update.callback_query.answer(text, show_alert=True)
         return ConversationHandler.END
-
     text = "💎 Diamond Bot မှ ကြိုဆိုပါတယ်။\nရွေးချယ်ပါ👇"
-    keyboard = [[InlineKeyboardButton("💎 Diamond", callback_data="show_dia"), InlineKeyboardButton("💵 UC", callback_data="show_uc")]]
+    keyboard = [[
+        InlineKeyboardButton("💎 စိန်ဝယ်ယူရန်", callback_data="show_dia"),
+        InlineKeyboardButton("💵 UCဝယ်ယူရန်", callback_data="show_uc")
+    ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     welcome_msg_id = await db.get_config("welcome_msg_id")
     if welcome_msg_id:
         try:
@@ -241,7 +255,6 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         except Exception as e:
             logger.error(f"Welcome copy failed: {e}")
-
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
     elif update.callback_query:
@@ -256,7 +269,6 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     admin_id = get_admin_id(context)
     query = update.callback_query
     await query.answer()
@@ -265,8 +277,6 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not prices:
         await query.message.reply_text("လောလောဆယ် ဈေးနှုန်း မရှိသေးပါ။")
         return ConversationHandler.END
-
-    # ✅ All active prices are now valid strings (numeric or pass names) – no filter needed
     sorted_prices = sort_price_items(prices)
     keyboard = []
     row = []
@@ -286,9 +296,8 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+    keyboard.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_main")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     msg_id_key = "dia_msg_id" if item_type == "dia" else "uc_msg_id"
     saved_msg_id = await db.get_config(msg_id_key)
     if saved_msg_id:
@@ -298,7 +307,6 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         except Exception as e:
             logger.error(f"Item menu copy failed: {e}")
-
     text = "ဈေးနှုန်းများ ရွေးချယ်ပါ👇"
     await query.message.edit_text(text, reply_markup=reply_markup)
     return ConversationHandler.END
@@ -311,7 +319,6 @@ async def step1_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     admin_id = get_admin_id(context)
     query = update.callback_query
     await query.answer()
@@ -320,20 +327,16 @@ async def step1_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Invalid selection")
         return ConversationHandler.END
     item_type = parts[1]
-    amount_str = parts[2]   # string, could be "392", "weekly_pass", etc.
-
-    # ✅ No int conversion needed – lookup by exact string
+    amount_str = parts[2]
     price_data = await db.get_price_by_amount(item_type, amount_str)
     if not price_data:
         await query.message.reply_text("⚠️ မတွေ့ပါ")
         return ConversationHandler.END
-
     order_id = f"ORD-{uuid.uuid4().hex[:6].upper()}"
     context.user_data['current_order_id'] = order_id
     context.user_data['item_type'] = item_type
     context.user_data['quantity'] = amount_str
     await db.create_order(order_id, query.from_user.id, query.from_user.first_name, amount_str, 0, item_type)
-
     if item_type == "uc":
         prompt_text = "🆔 Game ID ရိုက်ထည့်ပါ (ဥပမာ - 123456789)"
     else:
@@ -349,19 +352,16 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     text = update.message.text.strip()
     order_id = context.user_data.get('current_order_id')
     item_type = context.user_data.get('item_type')
     if order_id is None:
         await update.message.reply_text("⚠️ အော်ဒါအချက်အလက် ပျောက်ဆုံးသွားပါသဖြင့် ကျေးဇူးပြု၍ အော်ဒါအသစ် ပြန်လုပ်ပေးပါ။")
         return ConversationHandler.END
-
     order = await db.get_order(order_id)
     if not order:
         await update.message.reply_text("⏰ အော်ဒါသက်တမ်းကုန်သွားပါပြီ။ ကျေးဇူးပြု၍ ပြန်လည်စတင်ပေးပါ။")
         return ConversationHandler.END
-
     validation_result = validate_game_id(item_type, text)
     if validation_result is None:
         if item_type == "dia":
@@ -369,15 +369,14 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ UC အတွက် Format: `123456789` (ID တစ်ခုတည်း)")
         return WAIT_GAME_ID
-
     game_id, zone_id = validation_result
     await db.update_order_game_id(order_id, game_id, zone_id)
     safe_game_id = escape_html(game_id)
     safe_zone_id = escape_html(zone_id) if zone_id else ""
     confirm_text = f"🆔 Game ID: <b>{safe_game_id}{' (' + safe_zone_id + ')' if zone_id else ''}</b>"
     await update.message.reply_text(confirm_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data="confirm_id"),
-        InlineKeyboardButton("🔙 Back", callback_data="back_id")
+        InlineKeyboardButton("✅ အတည်ပြုမယ်", callback_data="confirm_id"),
+        InlineKeyboardButton("✏️ ID ပြန်ပြင်မယ်", callback_data="back_id")
     ]]))
     return WAIT_CONFIRMATION
 
@@ -389,7 +388,6 @@ async def step3_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     admin_id = get_admin_id(context)
     query = update.callback_query
     await query.answer()
@@ -399,12 +397,10 @@ async def step3_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if order_id is None:
         await query.message.reply_text("⚠️ အော်ဒါအချက်အလက် ပျောက်ဆုံးသွားပါသဖြင့် ကျေးဇူးပြု၍ အော်ဒါအသစ် ပြန်လုပ်ပေးပါ။")
         return ConversationHandler.END
-
     order = await db.get_order(order_id)
     if not order:
         await query.message.reply_text("⏰ အော်ဒါသက်တမ်းကုန်သွားပါပြီ။ ကျေးဇူးပြု၍ ပြန်လည်စတင်ပေးပါ။")
         return ConversationHandler.END
-
     if query.data == "back_id":
         await query.message.reply_text("🆔 Game ID ပြန်ရိုက်ထည့်ပါ")
         return WAIT_GAME_ID
@@ -414,17 +410,17 @@ async def step3_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if payment_msg_id:
             try:
                 await context.bot.copy_message(chat_id=query.message.chat_id, from_chat_id=admin_id, message_id=payment_msg_id, reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_user_{order_id}")
+                    InlineKeyboardButton("❌ မဝယ်တော့ပါ", callback_data=f"cancel_user_{order_id}")
                 ]]))
                 await safe_delete_message(query.message, context)
             except Exception as e:
                 logger.error(f"Payment image copy failed: {e}")
                 await query.message.edit_text("📸 ငွေလွှဲ Screenshot ပို့ပေးပါ", reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_user_{order_id}")
+                    InlineKeyboardButton("❌ မဝယ်တော့ပါ", callback_data=f"cancel_user_{order_id}")
                 ]]))
         else:
             await query.message.edit_text("📸 ငွေလွှဲ Screenshot ပို့ပေးပါ", reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_user_{order_id}")
+                InlineKeyboardButton("❌ မဝယ်တော့ပါ", callback_data=f"cancel_user_{order_id}")
             ]]))
         return WAIT_PAYMENT
     return ConversationHandler.END
@@ -436,7 +432,6 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
-
     admin_id = get_admin_id(context)
     if update.effective_chat:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
@@ -451,65 +446,35 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not order:
         await update.message.reply_text("⏰ အော်ဒါသက်တမ်းကုန်သွားပါပြီ။ ကျေးဇူးပြု၍ ပြန်လည်စတင်ပေးပါ။")
         return ConversationHandler.END
-
     await db.update_order_status(order_id, OrderStatus.VERIFYING)
     user = update.effective_user
     quantity = context.user_data.get('quantity', 'N/A')
     item_type = context.user_data.get('item_type', 'dia')
 
+    # Caption and buttons for admin
     caption = build_admin_caption(order, user.id, user.first_name, user.last_name,
                                   quantity, item_type, "စစ်ဆေးရန်...")
+    admin_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ လက်ခံမယ်", callback_data=f"admin_approve_{order_id}"),
+        InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data=f"admin_reject_{order_id}")
+    ]])
 
-    max_retries = 3
-    retry_delay = 5
-    forwarded_msg = None
+    # Send photo with caption and inline buttons directly to admin
+    try:
+        sent_to_admin = await context.bot.send_photo(
+            chat_id=admin_id,
+            photo=update.message.photo[-1].file_id,
+            caption=caption,
+            parse_mode=ADMIN_PARSE_MODE,
+            reply_markup=admin_markup
+        )
+        await db.set_order_admin_msg_id(order_id, sent_to_admin.message_id)
+    except Exception as e:
+        logger.error(f"Failed to send order to admin: {e}")
+        await update.message.reply_text("⚠️ Admin ထံ အချက်အလက်ပို့ရာတွင် ချို့ယွင်းသွားပါသည်။ နောက်မှ ထပ်ကြိုးစားပါ။")
+        return WAIT_PAYMENT
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            forwarded_msg = await update.message.forward(chat_id=admin_id)
-            break
-        except Exception as e:
-            logger.warning(f"Forward attempt {attempt}/{max_retries} failed: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delay)
-            else:
-                logger.error(f"All forward attempts failed for order {order_id}. Sending photo fallback.")
-                try:
-                    fallback_msg = await context.bot.send_photo(
-                        chat_id=admin_id,
-                        photo=update.message.photo[-1].file_id,
-                        caption=caption,
-                        parse_mode=ADMIN_PARSE_MODE,
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("✅ Approve", callback_data=f"admin_approve_{order_id}"),
-                            InlineKeyboardButton("❌ Reject", callback_data=f"admin_reject_{order_id}")
-                        ]])
-                    )
-                    await db.set_order_admin_msg_id(order_id, fallback_msg.message_id)
-                except Exception as fallback_e:
-                    logger.error(f"Fallback admin photo message also failed: {fallback_e}")
-                await update.message.reply_text("⚠️ Admin ထံ Screenshot ပို့မရသော်လည်း ပုံအား Admin ထံ တိုက်ရိုက်ပို့ပေးလိုက်ပါပြီ။ ကျေးဇူးပြု၍ စောင့်ပါ။")
-                return WAIT_PAYMENT
-
-    if forwarded_msg:
-        try:
-            admin_text_msg = await context.bot.send_message(
-                chat_id=admin_id,
-                text=caption,
-                parse_mode=ADMIN_PARSE_MODE,
-                reply_to_message_id=forwarded_msg.message_id,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Approve", callback_data=f"admin_approve_{order_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"admin_reject_{order_id}")
-                ]])
-            )
-            await db.set_order_admin_msg_id(order_id, admin_text_msg.message_id)
-            order = await db.get_order(order_id)
-        except Exception as e:
-            logger.error(f"Failed to send order detail to admin: {e}")
-            await update.message.reply_text("⚠️ Admin ထံ အချက်အလက်ပို့ရာတွင် ချို့ယွင်းသွားပါသည်။ နောက်မှ ထပ်ကြိုးစားပါ။")
-            return WAIT_PAYMENT
-
+    # Order summary for the user
     game_id = order.get("order_info", {}).get("game_id", "N/A")
     zone_id = order.get("order_info", {}).get("zone_id", "")
     if zone_id:
@@ -519,22 +484,20 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_summary = (
         f"📦 Order ID: <code>{escape_html(order_id)}</code>\n"
         f"🆔 Game ID: <b>{game_display}</b>\n"
-        f"{'💎' if item_type == 'dia' else '💵'} ပစ္စည်း: <b>{escape_html(quantity)} {item_type.upper()}</b>\n"
+        f"{'💎' if item_type == 'dia' else '💵'} ပစ္စည်း: <b>{escape_html(quantity)} {item_type.upper()}</b>\n\n"
+        f"✅ <b>လူကြီးမင်း၏ Order တင်မှု အောင်မြင်ပါသည်။</b>\n"
+        f"ငွေလွှဲမှုစစ်ဆေးပြီးပါက Item ထည့်သွင်းပေးပါမည်။ ခေတ္တစောင့်ဆိုင်းပေးပါ။"
     )
     await update.message.reply_text(order_summary, parse_mode="HTML")
     return ConversationHandler.END
 
-# ==========================================
-# 🔰 Admin-Only Handlers
-# ==========================================
-
+# ================== Admin Callback Handlers ==================
 @handle_errors
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
     if not db:
         await _send_db_error(update)
         return
-
     admin_id = get_admin_id(context)
     query = update.callback_query
     user_id = query.from_user.id
@@ -546,27 +509,24 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     await query.answer()
     data = query.data
-    order_id = data.split("_")[-1]
+    parts = data.split("_")
+    if len(parts) < 2:
+        return
+    order_id = parts[-1]
     order = await db.get_order(order_id)
     if not order:
         await query.answer("အော်ဒါ မတွေ့ပါ (ဖျက်ပြီးသားဖြစ်နိုင်သည်)။", show_alert=True)
         return
-
     user_id_customer = order.get("user_id")
     profile_name = order.get("profile_name", "")
-    # ✅ Fallback if profile_name is None/empty
     first_name = profile_name if profile_name else str(user_id_customer)
     last_name = None
     order_info = order.get('order_info', {})
     quantity = order_info.get('quantity', 'N/A')
     item_type = order_info.get('item_type', 'dia')
-
     if data.startswith("admin_approve_"):
         await db.update_order_status(order_id, OrderStatus.PROCESSING)
-        # 💎 FIXED: Always increment monthly count with the exact item name (string)
-        # No more numeric/string filtering – supports "100", "Weekly Pass", etc.
         await db.increment_monthly_count(quantity, item_type)
-
         await context.bot.send_message(
             chat_id=user_id_customer,
             text="✅ Admin မှ ငွေလွှဲမှုကို အတည်ပြုလိုက်ပါပြီ။ ခေတ္တစောင့်ပေးပါ၊ ပစ္စည်းထည့်ပေးနေပါပြီ။"
@@ -574,7 +534,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         new_caption = build_admin_caption(order, user_id_customer, first_name, last_name,
                                           quantity, item_type, "⏳ Approved - Waiting for completion")
         await edit_admin_message(query, new_caption, reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("💎 Complete", callback_data=f"admin_complete_{order_id}")
+            InlineKeyboardButton("💎 ထည့်ပြီးပြီ", callback_data=f"admin_complete_{order_id}")
         ]]))
     elif data.startswith("admin_complete_"):
         await db.update_order_status(order_id, OrderStatus.COMPLETED)
@@ -606,8 +566,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                                           quantity, item_type, "❌ Rejected")
         await edit_admin_message(query, new_caption, reply_markup=None)
         await db.orders.update_one({"order_id": order_id}, {"$unset": {"admin_msg_id": ""}})
-    elif data.startswith("admin_undo_"):
-        pass
     elif data.startswith("admin_manual_"):
         await db.update_order_status(order_id, OrderStatus.COMPLETED)
         new_caption = build_admin_caption(order, user_id_customer, first_name, last_name,
@@ -622,7 +580,6 @@ async def user_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not db:
         await _send_db_error(update)
         return
-
     query = update.callback_query
     await query.answer()
     order_id = query.data.split("_")[-1]
@@ -633,7 +590,6 @@ async def user_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if order['status'] != OrderStatus.WAITING_PAYMENT:
         await query.message.reply_text("⚠️ ယခုအဆင့်တွင် Cancel ပြုလုပ်၍မရပါ။")
         return
-
     await db.delete_order(order_id)
     admin_msg_id = order.get("admin_msg_id")
     if admin_msg_id:
@@ -674,7 +630,6 @@ async def user_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     logger.warning(f"Could not update admin cancel message for {order_id}: {e2}")
         except Exception as e:
             logger.warning(f"Could not update admin cancel message for {order_id}: {e}")
-
     await query.message.edit_text("✅ Cancel ပြီး")
 
 @handle_errors
@@ -686,25 +641,18 @@ async def new_order_callback_handler(update: Update, context: ContextTypes.DEFAU
     await send_welcome(update, context)
     return ConversationHandler.END
 
-# ==========================================
-# 🔰 Administrative Command Handlers
-# ==========================================
-
+# ================== Admin Commands ==================
 @handle_errors
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
+    if master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context):
         await db.set_service_status(False)
         await update.message.reply_text("🛑 Service ခေတ္တရပ်ထားပါသည် (Maintenance Mode: ON).")
-        return
-    if not await is_owner_or_master(update.effective_user.id, context):
-        return
-    await db.set_service_status(False)
-    await update.message.reply_text("🛑 Service ခေတ္တရပ်ထားပါသည် (Maintenance Mode: ON).")
+    else:
+        await update.message.reply_text("⛔ အခွင့်အရေးမရှိပါ။")
 
 @handle_errors
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -712,15 +660,11 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
+    if master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context):
         await db.set_service_status(True)
         await update.message.reply_text("✅ Service ပြန်လည်ဖွင့်လှစ်လိုက်ပါပြီ (Maintenance Mode: OFF).")
-        return
-    if not await is_owner_or_master(update.effective_user.id, context):
-        return
-    await db.set_service_status(True)
-    await update.message.reply_text("✅ Service ပြန်လည်ဖွင့်လှစ်လိုက်ပါပြီ (Maintenance Mode: OFF).")
+    else:
+        await update.message.reply_text("⛔ အခွင့်အရေးမရှိပါ။")
 
 @handle_errors
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -728,57 +672,27 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
-
     if not update.message.reply_to_message:
         await update.message.reply_text("❌ ပို့ချင်သော Message ကို Reply လုပ်ပြီး /post ကိုသုံးပါ။")
         return
-    users = await db.orders.distinct("user_id")
-    if not users:
-        await update.message.reply_text("❌ ပို့ရန် User မရှိပါ။")
-        return
-    await update.message.reply_text(f"⏳ Users ({len(users)}) ယောက်ဆီသို့ စတင်ပို့ဆောင်နေပါပြီ...")
-    BATCH_SIZE = 25
-    success_count = 0
-    failed_users = []
-    for i in range(0, len(users), BATCH_SIZE):
-        batch = users[i:i + BATCH_SIZE]
-        tasks = []
-        for user_id in batch:
-            tasks.append(_send_broadcast_message(context, update, user_id))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for user_id, result in zip(batch, results):
-            if isinstance(result, Exception):
-                logger.error(f"Broadcast failed to {user_id}: {result}")
-                failed_users.append(user_id)
-            else:
-                success_count += result
-        await asyncio.sleep(1.1)
-    report = f"✅ Broadcast ပြီးဆုံးပါပြီ။ အောင်မြင်စွာပို့နိုင်ခဲ့သူ: {success_count} ယောက်။"
-    if failed_users:
-        report += f"\n\n❌ မအောင်မြင်သူ ({len(failed_users)} ယောက်) - ပထမဆုံး ၅ ယောက်: {failed_users[:5]}"
-    await update.message.reply_text(report)
-
-async def _send_broadcast_message(context, update, user_id):
-    while True:
+    all_orders = await db.orders.find({}, {"user_id": 1}).to_list(length=None)
+    unique_users = list(set(o['user_id'] for o in all_orders if 'user_id' in o))
+    await update.message.reply_text(f"⏳ သုံးစွဲသူ {len(unique_users)} ဦးဆီသို့ စတင်ပို့နေပါသည်...")
+    success = 0
+    for user_id in unique_users:
         try:
-            await context.bot.copy_message(chat_id=user_id, from_chat_id=update.message.chat_id, message_id=update.message.reply_to_message.message_id)
-            return 1
-        except Forbidden:
-            # User has blocked the bot – skip permanently, do not delete their orders
-            logger.info(f"User {user_id} has blocked the bot. Skipping broadcast.")
-            return 0
-        except RetryAfter as e:
-            wait_time = e.retry_after + 1
-            logger.warning(f"Rate limited. Retry after {wait_time}s for user {user_id}")
-            await asyncio.sleep(wait_time)
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=update.message.chat_id,
+                message_id=update.message.reply_to_message.message_id
+            )
+            success += 1
+            await asyncio.sleep(0.05)
         except Exception as e:
-            logger.error(f"Broadcast failed to {user_id}: {e}")
-            return 0
+            logger.warning(f"Broadcast failed to {user_id}: {e}")
+    await update.message.reply_text(f"✅ ပြီးဆုံးပါသည်။ အောင်မြင်မှု - {success}/{len(unique_users)}")
 
 @handle_errors
 async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,12 +700,7 @@ async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        count = await db.get_total_users_count()
-        await update.message.reply_text(f"📊 လက်ရှိသုံးနေသူ {count} ယောက် ရှိပါသည်။")
-        return
-    if not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
     count = await db.get_total_users_count()
     await update.message.reply_text(f"📊 လက်ရှိသုံးနေသူ {count} ယောက် ရှိပါသည်။")
@@ -802,14 +711,10 @@ async def set_welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
     if update.message.reply_to_message:
-        msg_id = update.message.reply_to_message.message_id
-        await db.set_config("welcome_msg_id", msg_id)
+        await db.set_config("welcome_msg_id", update.message.reply_to_message.message_id)
         await update.message.reply_text("✅ Welcome Message ID သိမ်းဆည်းပြီးပါပြီ။")
     else:
         await update.message.reply_text("❌ Reply လုပ်ပြီးမှ /setwelcome ကိုသုံးပါ။")
@@ -820,14 +725,10 @@ async def set_dia_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
     if update.message.reply_to_message:
-        msg_id = update.message.reply_to_message.message_id
-        await db.set_config("dia_msg_id", msg_id)
+        await db.set_config("dia_msg_id", update.message.reply_to_message.message_id)
         await update.message.reply_text("✅ Dia ဈေးနှုန်းပုံ Message ID သိမ်းဆည်းပြီးပါပြီ။")
         return
     match = re.match(r"/setdia\s+(.+)", update.message.text)
@@ -844,14 +745,10 @@ async def set_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
     if update.message.reply_to_message:
-        msg_id = update.message.reply_to_message.message_id
-        await db.set_config("uc_msg_id", msg_id)
+        await db.set_config("uc_msg_id", update.message.reply_to_message.message_id)
         await update.message.reply_text("✅ UC ဈေးနှုန်းပုံ Message ID သိမ်းဆည်းပြီးပါပြီ။")
         return
     match = re.match(r"/setuc\s+(.+)", update.message.text)
@@ -868,21 +765,14 @@ async def delete_dia_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
-    try:
-        amount = ' '.join(context.args)
-        if not amount:
-            await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည်ထည့်ပါ။ e.g. /deletedia Weekly Pass")
-            return
-        await db.set_price_active("dia", amount, False)
-        await update.message.reply_text(f"✅ Dia {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
-    except Exception as e:
-        logger.error(f"Delete dia error: {e}")
-        await update.message.reply_text("❌ Error: /deletedia [item_name]")
+    amount = ' '.join(context.args)
+    if not amount:
+        await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည် ထည့်ပါ။ e.g. /deletedia Weekly Pass")
+        return
+    await db.set_price_active("dia", amount, False)
+    await update.message.reply_text(f"✅ Dia {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
 
 @handle_errors
 async def delete_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -890,21 +780,14 @@ async def delete_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
-    try:
-        amount = ' '.join(context.args)
-        if not amount:
-            await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည်ထည့်ပါ။ e.g. /deleteuc Weekly Pass")
-            return
-        await db.set_price_active("uc", amount, False)
-        await update.message.reply_text(f"✅ UC {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
-    except Exception as e:
-        logger.error(f"Delete uc error: {e}")
-        await update.message.reply_text("❌ Error: /deleteuc [item_name]")
+    amount = ' '.join(context.args)
+    if not amount:
+        await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည် ထည့်ပါ။ e.g. /deleteuc Weekly Pass")
+        return
+    await db.set_price_active("uc", amount, False)
+    await update.message.reply_text(f"✅ UC {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
 
 @handle_errors
 async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -912,33 +795,24 @@ async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not db:
         await _send_db_error(update)
         return
-
-    if master.is_master(update.effective_user.id):
-        pass
-    elif not await is_owner_or_master(update.effective_user.id, context):
+    if not (master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context)):
         return
     dia_prices = sort_price_items(await db.get_active_prices("dia"))
     uc_prices = sort_price_items(await db.get_active_prices("uc"))
-
-    text = "📋 Active Items:\n\n"
-    text += "💎 Diamond:\n"
+    text = "📋 Active Items:\n\n💎 Diamond:\n"
     for p in dia_prices:
-        amount = p.get('amount') or p.get('diamond')
-        text += f"{amount}\n"
+        text += f"{p.get('amount') or p.get('diamond')}\n"
     text += "\n💵 UC:\n"
     for p in uc_prices:
-        amount = p.get('amount') or p.get('diamond')
-        text += f"{amount}\n"
+        text += f"{p.get('amount') or p.get('diamond')}\n"
     await update.message.reply_text(text)
 
 @handle_errors
 async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_typing(update, context)
     db = get_db(context)
     if not db:
         await _send_db_error(update)
         return
-
     user_id = update.effective_user.id
     if not master.is_master(user_id):
         return
@@ -953,42 +827,26 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await db.add_or_update_license(target_id, months)
             await update.message.reply_text(f"✅ User `{target_id}` အား {months} လ လိုင်စင်တိုးပေးပြီးပါပြီ။", parse_mode="Markdown")
-            signal_text = f"/license_added {target_id} {months}"
             try:
-                await context.bot.send_message(chat_id=admin_id, text=signal_text)
-                logger.info(f"License update signal sent to bot: {signal_text}")
+                await context.bot.send_message(chat_id=admin_id, text=f"/license_added {target_id} {months}")
             except Exception as e:
                 logger.error(f"Failed to send license signal: {e}")
-        except ValueError as e:
-            logger.error(f"Paid command parsing error: {e}")
+        except ValueError:
             await update.message.reply_text("❌ Format: `/paid user_id months`")
         return
+
     licenses = await db.get_all_licenses()
     if not licenses:
         await update.message.reply_text("📭 လိုင်စင်ရှိသူ မရှိသေးပါ။")
         return
-    bot_info = await db.get_bot_info()
-    bot_link = bot_info.get("bot_link", "https://t.me/YourBot")
-    bot_username = bot_info.get("bot_username", "YourBot")
-    bot_link_safe = escape_html(bot_link)
-    bot_username_safe = escape_html(bot_username)
-    lines = ["📋 <b>လိုင်စင်ရှိသူများ</b>\n"]
-    for lic in licenses:
-        uid = lic["user_id"]
-        expiry = lic.get("expiry_date", datetime.now()).strftime("%Y-%m-%d")  # ✅ fallback for missing date
-        user_mention = safe_user_mention(uid, fallback=str(uid))
-        lines.append(f"👤 {user_mention}  |  ⏳ {expiry}")
-    lines.append(f"\n🤖 <a href=\"{bot_link_safe}\">{bot_username_safe}</a>")
-    text = "\n".join(lines)
+    text = "📋 <b>လိုင်စင်စာရင်း (အသေးစိတ်ကြည့်ရန် နှိပ်ပါ)</b>"
     keyboard = []
     for lic in licenses:
         uid = lic["user_id"]
-        keyboard.append([
-            InlineKeyboardButton(f"➕ +1 month ({uid})", callback_data=f"license_add1_{uid}"),
-            InlineKeyboardButton(f"➕ +3 month ({uid})", callback_data=f"license_add3_{uid}"),
-            InlineKeyboardButton(f"❌ Revoke ({uid})", callback_data=f"license_revoke_{uid}")
-        ])
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        expiry = lic.get("expiry_date")
+        time_left = get_remaining_time_str(expiry)
+        keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"lic_view_{uid}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(text, parse_mode=ADMIN_PARSE_MODE, reply_markup=reply_markup)
 
 @handle_errors
@@ -997,63 +855,66 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
     if not db:
         await _send_db_error(update)
         return
-
     query = update.callback_query
-    user_id = query.from_user.id
-    if not master.is_master(user_id):
+    if not master.is_master(query.from_user.id):
         await query.answer("⛔ ခွင့်ပြုချက်မရှိပါ။", show_alert=True)
         return
     await query.answer()
     data = query.data
-    parts = data.split("_")
-    action = parts[1]
-    # ✅ Safe int conversion for target_id
-    try:
-        target_id = int(parts[2])
-    except (ValueError, IndexError):
-        await query.answer("Invalid target user ID.", show_alert=True)
-        return
 
-    if action == "add1":
-        await db.add_or_update_license(target_id, 1)
-        status_msg = f"✅ User `{target_id}` အား ၁ လ တိုးပေးပြီးပါပြီ။"
-    elif action == "add3":
-        await db.add_or_update_license(target_id, 3)
-        status_msg = f"✅ User `{target_id}` အား ၃ လ တိုးပေးပြီးပါပြီ။"
-    elif action == "revoke":
-        await db.licenses.delete_one({"user_id": target_id})
-        status_msg = f"❌ User `{target_id}` ၏ လိုင်စင်ကို ရုပ်သိမ်းလိုက်ပါပြီ။"
-    else:
-        return
-    licenses = await db.get_all_licenses()
-    bot_info = await db.get_bot_info()
-    bot_link = bot_info.get("bot_link", "https://t.me/YourBot")
-    bot_username = bot_info.get("bot_username", "YourBot")
-    bot_link_safe = escape_html(bot_link)
-    bot_username_safe = escape_html(bot_username)
-    lines = ["📋 <b>လိုင်စင်ရှိသူများ</b>\n"]
-    if not licenses:
-        lines = ["📭 လိုင်စင်ရှိသူ မရှိသေးပါ။"]
-    else:
+    if data.startswith("lic_view_"):
+        target_id = int(data.split("_")[-1])
+        lic = await db.licenses.find_one({"user_id": target_id})
+        if not lic:
+            await query.answer("မတွေ့တော့ပါ။", show_alert=True)
+            return
+        expiry = lic.get("expiry_date")
+        text = (
+            f"👤 <b>User အချက်အလက်</b>\n\n"
+            f"🆔 ID: <code>{target_id}</code>\n"
+            f"⏳ သက်တမ်းကုန်မည့်ရက်: {expiry.strftime('%Y-%m-%d') if expiry else 'N/A'}\n"
+            f"📊 အခြေအနေ: {get_remaining_time_str(expiry)}"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ 1 လတိုး", callback_data=f"lic_add_1_{target_id}"),
+                InlineKeyboardButton("➕ 3 လတိုး", callback_data=f"lic_add_3_{target_id}")
+            ],
+            [InlineKeyboardButton("🚫 လိုင်စင်ပိတ်မယ်", callback_data=f"lic_revoke_{target_id}")],
+            [InlineKeyboardButton("🔙 စာရင်းသို့", callback_data="lic_main_list")]
+        ]
+        await query.edit_message_text(text, parse_mode=ADMIN_PARSE_MODE, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "lic_main_list":
+        licenses = await db.get_all_licenses()
+        keyboard = []
         for lic in licenses:
             uid = lic["user_id"]
-            expiry = lic.get("expiry_date", datetime.now()).strftime("%Y-%m-%d")
-            user_mention = safe_user_mention(uid, fallback=str(uid))
-            lines.append(f"👤 {user_mention}  |  ⏳ {expiry}")
-        lines.append(f"\n🤖 <a href=\"{bot_link_safe}\">{bot_username_safe}</a>")
-    text = "\n".join(lines)
-    keyboard = []
-    if licenses:
-        for lic in licenses:
-            uid = lic["user_id"]
-            keyboard.append([
-                InlineKeyboardButton(f"➕ +1 month ({uid})", callback_data=f"license_add1_{uid}"),
-                InlineKeyboardButton(f"➕ +3 month ({uid})", callback_data=f"license_add3_{uid}"),
-                InlineKeyboardButton(f"❌ Revoke ({uid})", callback_data=f"license_revoke_{uid}")
-            ])
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    await query.answer(status_msg, show_alert=True)
-    await query.edit_message_text(text=text, parse_mode=ADMIN_PARSE_MODE, reply_markup=reply_markup)
+            expiry = lic.get("expiry_date")
+            time_left = get_remaining_time_str(expiry)
+            keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"lic_view_{uid}")])
+        await query.edit_message_text(
+            "📋 <b>လိုင်စင်စာရင်း</b>",
+            parse_mode=ADMIN_PARSE_MODE,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("lic_add_") or data.startswith("lic_revoke_"):
+        parts = data.split("_")
+        if len(parts) < 4:
+            return
+        action = parts[1]
+        if action == "add":
+            months = int(parts[2])
+            target_id = int(parts[3])
+            await db.add_or_update_license(target_id, months)
+            await query.answer(f"✅ {months} လ တိုးပေးပြီးပါပြီ", show_alert=True)
+        elif action == "revoke":
+            target_id = int(parts[2])
+            await db.licenses.delete_one({"user_id": target_id})
+            await query.answer("❌ လိုင်စင်ဖျက်သိမ်းပြီးပါပြီ", show_alert=True)
+        query.data = f"lic_view_{target_id}"
+        await license_callback_handler(update, context)
 
 @handle_errors
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,33 +922,27 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return
-
     user_id = update.effective_user.id
-    admin_id = get_admin_id(context)
     if not await is_owner_or_master(user_id, context):
         await update.message.reply_text("⛔ ဤ Command ကို အသုံးပြုခွင့် မရှိပါ။")
         return
+
+    if not check_refresh_limit(user_id, context):
+        await update.message.reply_text("⚠️ တစ်ရက်ကို ၃ ကြိမ်သာ Refresh လုပ်ခွင့်ရှိပါသည်။ မနက်ဖြန်မှ ထပ်စမ်းပါ။")
+        return
+
     await send_typing(update, context)
-    status_msg = await update.message.reply_text("⏳ လိုင်စင်ကို Master Server သို့ ချိတ်ဆက်စစ်ဆေးနေပါသည်...")
+    admin_id = get_admin_id(context)
     valid = await db.force_refresh_license(admin_id)
     if valid:
-        result_text = "✅ လိုင်စင်ကို အောင်မြင်စွာ ပြန်လည်စစ်ဆေးပြီးပါပြီ။\nလက်ရှိတွင် **လိုင်စင်သက်တမ်းရှိနေပါသည်**။"
+        _, expiry = await db.check_license_local(admin_id)
+        time_str = get_remaining_time_str(expiry)
+        msg = f"✅ လိုင်စင်ရှိနေပါသည်။\n⏳ သက်တမ်းကျန်: {time_str}"
     else:
-        result_text = "❌ လိုင်စင်ကို ပြန်လည်စစ်ဆေးပြီးပါပြီ။\nလက်ရှိတွင် **လိုင်စင်သက်တမ်း မရှိပါ** သို့မဟုတ် **သက်တမ်းကုန်သွားပါပြီ**။"
-    try:
-        await status_msg.edit_text(result_text, parse_mode="Markdown")
-    except Exception:
-        await status_msg.edit_text(result_text)
+        msg = "❌ လိုင်စင် မရှိပါ သို့မဟုတ် သက်တမ်းကုန်နေပါသည်။"
+    await update.message.reply_text(msg)
 
-# --- (၃) Database error helper ---
-async def _send_db_error(update: Update):
-    msg = "⚠️ ဒေတာဘေ့စ် ချိတ်ဆက်မှု မရှိပါ။ ကျေးဇူးပြု၍ ခဏနေမှ ထပ်စမ်းကြည့်ပါ။"
-    if update.message:
-        await update.message.reply_text(msg)
-    elif update.callback_query:
-        await update.callback_query.answer(msg, show_alert=True)
-
-# --- (၄) Background timeout checker ---
+# ================== Background Jobs ==================
 async def check_timeouts(context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
     if not db:
@@ -1098,3 +953,26 @@ async def check_timeouts(context: ContextTypes.DEFAULT_TYPE):
             await db.delete_order(order['order_id'])
     except Exception as e:
         logger.error(f"Timeout check error: {e}")
+
+# ================== Database Migration Command (Master Only) ==================
+@handle_errors
+async def fix_database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = get_db(context)
+    if not db:
+        await _send_db_error(update)
+        return
+
+    # Bot Owner (Master) ဟုတ်မဟုတ် အရင်စစ်မယ်
+    if not master.is_master(update.effective_user.id):
+        await update.message.reply_text("⛔ ဒီခလုတ်ကို သုံးပိုင်ခွင့်မရှိပါ။")
+        return
+
+    # ဒေတာဟောင်းတွေကို အသစ်ဖြစ်အောင် စတင်ပြင်ဆင်မယ်
+    count = await db.migrate_legacy_diamond_types()
+
+    if count == -1:
+        await update.message.reply_text("❌ ဒေတာပြင်ဆင်မှု မအောင်မြင်ပါ။")
+    elif count == 0:
+        await update.message.reply_text("✅ ပြင်စရာ ဒေတာမရှိတော့ပါ။ အားလုံး အဆင်ပြေနေပါပြီ။")
+    else:
+        await update.message.reply_text(f"✅ ဒေတာဟောင်း {count} ခုကို Version အသစ်ဖြစ်အောင် ပြုပြင်ပြီးပါပြီ။")
