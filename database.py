@@ -560,12 +560,15 @@ class DatabaseManager:
     # ----------------------------------------------------------------------
     @staticmethod
     def _price_sort_key(item: dict):
-        """Sort key for prices: numeric strings by integer value, then non-numeric strings alphabetically (case‑insensitive)."""
-        diamond = item.get("diamond", "")
-        if isinstance(diamond, str) and diamond.isdigit():
+        """
+        Sort key for prices: numeric strings by integer value, then non-numeric strings alphabetically (case‑insensitive).
+        Now safe for legacy integer/None diamond values.
+        """
+        raw_diamond = item.get("diamond", "")
+        diamond = str(raw_diamond) if raw_diamond is not None else ""
+        if diamond.isdigit():
             return (0, int(diamond))
         else:
-            # Use .lower() for case‑insensitive alphabetical ordering
             return (1, diamond.lower())
 
     async def add_or_update_price(self, diamond, item_type: str = "dia") -> bool:
@@ -803,7 +806,7 @@ class DatabaseManager:
                 )
             return report_data
         except Exception as e:
-            logger.error(f"Error generating monthly report for {year_month}: {e}")
+            logger.error(f"Error generating monthly report for {year_month}: {e}", exc_info=True)
             return {"Total Orders": 0, "Items Sold": "Error"}
 
     async def purge_3_months_old_data(self) -> Tuple[int, int]:
@@ -822,3 +825,28 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error purging old data: {e}")
             return 0, 0
+
+    # ----------------------------------------------------------------------
+    # Legacy Data Migration Helper (Run this once if old integer diamonds exist)
+    # ----------------------------------------------------------------------
+    async def migrate_legacy_diamond_types(self):
+        """
+        Convert any remaining integer diamond values in Prices collection to strings.
+        Can be triggered from admin panel.
+        """
+        updated = 0
+        try:
+            async for doc in self.prices.find({"diamond": {"$exists": True}}):
+                diamond = doc.get("diamond")
+                if not isinstance(diamond, str):
+                    new_val = str(diamond) if diamond is not None else ""
+                    await self.prices.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"diamond": new_val}}
+                    )
+                    updated += 1
+            logger.info(f"Migrated {updated} non-string diamond values to strings.")
+            return updated
+        except Exception as e:
+            logger.error(f"Legacy migration error: {e}")
+            return -1
