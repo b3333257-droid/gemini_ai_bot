@@ -1,4 +1,4 @@
-# main.py (Final - Clean imports, License wrap via handlers)
+# main.py - Final version with Clickable Owner Name & User ID, full API startup notification, and /fixdb command
 import os
 import sys
 import logging
@@ -94,16 +94,16 @@ from handlers import (
     check_timeouts, paid_command, set_dia_command, set_uc_command,
     delete_dia_command, delete_uc_command, set_welcome_command,
     check_price_command, stop_command, open_command, post_command,
-    active_command, refresh_command
+    active_command, refresh_command, fix_database_command  # ✅ Added
 )
 
 # ==========================================
-# 🛡 Startup Access Guard (FIXED: send to ADMIN_ID first)
+# 🛡 Startup Access Guard (send to OWNER only)
 # ==========================================
 async def check_startup_access(app) -> bool:
-    """Send startup notification to ADMIN_ID (owner) and optionally to MASTER_ID if different."""
+    """Send startup notification to ADMIN_ID (owner) only."""
     try:
-        # Fetch owner info (needs /start prior, but will try gracefully)
+        # Fetch owner info
         try:
             owner_chat = await app.bot.get_chat(ADMIN_ID)
             owner_name = owner_chat.first_name or owner_chat.username or str(ADMIN_ID)
@@ -130,7 +130,7 @@ async def check_startup_access(app) -> bool:
             f"Bot is now running and accepting commands."
         )
 
-        # 🎯 Primary notification to ADMIN_ID (owner)
+        # Only send to ADMIN_ID (owner of this client bot)
         try:
             await app.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -140,19 +140,6 @@ async def check_startup_access(app) -> bool:
             logger.info(f"Startup notification sent to ADMIN {ADMIN_ID}")
         except Exception as e:
             logger.warning(f"Could not send startup notification to ADMIN {ADMIN_ID}: {e}")
-
-        # 🎯 If MASTER_ID is set and different from ADMIN, also send there
-        if master.MASTER_ID is not None and master.MASTER_ID != ADMIN_ID:
-            try:
-                # Optionally check if master has started the bot; if fail, ignore
-                await app.bot.send_message(
-                    chat_id=master.MASTER_ID,
-                    text=startup_msg,
-                    parse_mode="HTML"
-                )
-                logger.info(f"Startup notification sent to MASTER {master.MASTER_ID}")
-            except Exception as e:
-                logger.warning(f"Could not send startup notification to MASTER: {e}")
 
         return True
     except Exception as e:
@@ -171,7 +158,6 @@ async def post_init(application):
         application.bot_data['admin_id'] = ADMIN_ID
         quart_app.config['db'] = db
         quart_app.config['ADMIN_ID'] = ADMIN_ID
-        # ✅ Store bot instance for API usage
         quart_app.config['bot'] = application.bot
         db.start_cache_cleanup()
 
@@ -187,10 +173,10 @@ async def post_init(application):
         logger.info("Initializing Database Indexes...")
         await db.setup_indexes()
 
-        # ✅ Load banned users list from DB into memory
+        # Load banned users list from DB into memory
         await master.load_banned_users_from_db(db)
 
-        # ✅ Use DatabaseManager methods instead of direct collection access
+        # Initialize last_report_month config
         current_month_str = datetime.now(UTC_TZ).strftime("%Y-%m")
         existing_report_month = await db.get_config("last_report_month")
         if not existing_report_month:
@@ -208,10 +194,11 @@ async def post_init(application):
 
     await check_startup_access(application)
 
-    # ✅ Notify Master server about client startup via API
+    # Notify Master server about client startup via API (with details)
     db_instance = application.bot_data.get('db')
     if db_instance and db_instance.is_client_mode:
-        await notify_master_startup(db_instance.MASTER_API_URL, db_instance.API_SECRET_TOKEN, ADMIN_ID)
+        await notify_master_startup(application.bot, db_instance.MASTER_API_URL,
+                                    db_instance.API_SECRET_TOKEN, ADMIN_ID)
 
     jq = application.job_queue
     if jq and db_instance.is_client_mode:
@@ -232,7 +219,7 @@ async def post_init(application):
 
 
 # ==========================================
-# 📊 Monthly Report Job (FIXED: uses get_config/set_config)
+# 📊 Monthly Report Job
 # ==========================================
 async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
@@ -241,7 +228,6 @@ async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE):
         return
     now = datetime.now(UTC_TZ)
     current_month_str = now.strftime("%Y-%m")
-    # ✅ Use get_config instead of db.settings.find_one
     last_report_month = await db.get_config("last_report_month")
     if not last_report_month:
         await db.set_config("last_report_month", current_month_str)
@@ -256,7 +242,6 @@ async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE):
             f"📦 <b>Items Sold:</b>\n{report.get('Items Sold', 'အရောင်းမရှိပါ')}\n"
         )
         await context.bot.send_message(chat_id=admin_id, text=report_text, parse_mode="HTML")
-        # ✅ Update using set_config
         await db.set_config("last_report_month", current_month_str)
     except Exception as e:
         logger.error(f"Error in monthly report job: {e}")
@@ -266,7 +251,6 @@ async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE):
 # 🧹 Background Cleanup Jobs
 # ==========================================
 async def clean_expired_licenses(context: ContextTypes.DEFAULT_TYPE):
-    """Remove licenses that have expired."""
     db = context.bot_data.get('db')
     if db is None:
         return
@@ -278,7 +262,6 @@ async def clean_expired_licenses(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error cleaning expired licenses: {e}")
 
 async def purge_old_data_job(context: ContextTypes.DEFAULT_TYPE):
-    """Delete orders and reports older than 90 days (3 months)."""
     db = context.bot_data.get('db')
     if db is None:
         return
@@ -293,14 +276,13 @@ async def purge_old_data_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# 🚨 Global Error Handler (Security Improved)
+# 🚨 Global Error Handler
 # ==========================================
 _last_error_notifications = {}
 _ERROR_DEBOUNCE_SECONDS = 300
 
 def _get_error_signature(error: Exception) -> str:
-    error_type = type(error).__name__
-    return error_type
+    return type(error).__name__
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if context.error:
@@ -353,7 +335,7 @@ async def health():
 async def api_license_check(user_id: int):
     auth_header = request.headers.get('Authorization', '')
     expected_secret = os.getenv("API_SECRET_TOKEN", "")
-    
+
     if not expected_secret:
         logger.error("API_SECRET_TOKEN is not configured!")
         return jsonify({"error": "Server configuration error"}), 500
@@ -381,9 +363,9 @@ async def api_license_check(user_id: int):
     }
     return jsonify(response_data), 200
 
-# ✅ New endpoint: client notifies master on startup
-@quart_app.route('/api/notify_startup/<int:client_admin_id>', methods=['POST'])
-async def api_notify_startup(client_admin_id: int):
+# ✅ Corrected endpoint for client startup notification (Clickable Name + User ID)
+@quart_app.route('/api/notify_startup', methods=['POST'])
+async def api_notify_startup():
     auth_header = request.headers.get('Authorization', '')
     expected_secret = os.getenv("API_SECRET_TOKEN", "")
 
@@ -403,14 +385,32 @@ async def api_notify_startup(client_admin_id: int):
     if not admin_id:
         return jsonify({"error": "Admin ID not configured"}), 500
 
+    data = await request.get_json()
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+
+    client_admin_id = data.get('admin_id')
+    owner_name = data.get('owner_name', 'Unknown')
+    bot_username = data.get('bot_username', 'N/A')
+    time_str = data.get('time', '')
+
+    # Both owner name and user ID are clickable links to Telegram profile
+    safe_owner = html.escape(owner_name)
+    owner_link = f'<a href="tg://user?id={client_admin_id}">{safe_owner}</a>'
+    owner_id_link = f'<a href="tg://user?id={client_admin_id}">{client_admin_id}</a>'
+
+    msg = (
+        f"🔔 <b>Client Bot Online</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Owner:</b> {owner_link}\n"
+        f"🆔 <b>User ID:</b> {owner_id_link}\n"
+        f"🤖 <b>Bot:</b> {bot_username}\n"
+        f"📅 <b>Time:</b> {time_str}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
     try:
-        await bot.send_message(
-            chat_id=admin_id,
-            text=f"🔔 <b>Client Bot Started</b>\n\n"
-                 f"👤 Client Admin ID: <code>{client_admin_id}</code>\n\n"
-                 f"Client bot is now running and connected to your server.",
-            parse_mode="HTML"
-        )
+        await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML")
         return jsonify({"status": "notified"}), 200
     except Exception as e:
         logger.error(f"Failed to send startup notification to master: {e}")
@@ -425,7 +425,6 @@ async def run_quart():
 # 🆕 Master Signal Handler
 # ==========================================
 async def master_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /license command from master to directly add license."""
     user_id = update.effective_user.id
     if master.MASTER_ID is None or str(user_id) != str(master.MASTER_ID):
         return
@@ -451,24 +450,51 @@ async def master_signal_handler(update: Update, context: ContextTypes.DEFAULT_TY
         logger.debug(f"Could not delete master signal message: {e}")
 
 # ==========================================
-# 📞 Client startup notification helper
+# 📞 Client startup notification helper (sends JSON with full details)
 # ==========================================
-async def notify_master_startup(master_api_url: str, secret_token: str, admin_id: int):
-    """Call master server to notify that this client bot has started."""
+async def notify_master_startup(bot, master_api_url: str, secret_token: str, admin_id: int):
+    """Call master server to notify that this client bot has started, with full details."""
     if not master_api_url:
         logger.warning("MASTER_API_URL not set, cannot notify master about startup.")
         return
-    url = f"{master_api_url.rstrip('/')}/api/notify_startup/{admin_id}"
+
+    # Gather client details
+    owner_name = "Unknown"
+    bot_username = "N/A"
+    time_str = datetime.now(pytz.timezone('Asia/Yangon')).strftime('%Y-%m-%d %H:%M:%S (MMT)')
+
+    try:
+        owner_chat = await bot.get_chat(admin_id)
+        owner_name = owner_chat.first_name or owner_chat.username or str(admin_id)
+    except Exception as e:
+        logger.warning(f"Could not fetch owner info for startup notification: {e}")
+
+    try:
+        me = await bot.get_me()
+        bot_username = f"@{me.username}" if me.username else bot_username
+    except Exception:
+        pass
+
+    payload = {
+        "admin_id": admin_id,
+        "owner_name": owner_name,
+        "bot_username": bot_username,
+        "time": time_str
+    }
+
+    url = master_api_url.rstrip('/') + '/api/notify_startup'
     headers = {"Authorization": f"Bearer {secret_token}"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(url, json=payload, headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     logger.info("Master notified of client startup successfully.")
                 else:
                     logger.warning(f"Master notification returned status {resp.status}")
     except Exception as e:
         logger.error(f"Failed to notify master about startup: {e}")
+
 
 # ==========================================
 # 🚀 Main Entry Point
@@ -493,11 +519,11 @@ async def main_async():
         ("post", post_command),
         ("active", active_command),
         ("refresh", refresh_command),
+        ("fixdb", fix_database_command),  # ✅ Added /fixdb command
     ]
     for cmd, handler_func in ADMIN_COMMANDS:
         app.add_handler(CommandHandler(cmd, handler_func))
 
-    # User-facing handlers with License Wrap
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
@@ -516,7 +542,6 @@ async def main_async():
     )
     app.add_handler(conv_handler)
 
-    # Order management callbacks (Admin only, own permission check inside)
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(user_cancel_handler, pattern=r"^cancel_user_"))
     app.add_handler(CallbackQueryHandler(license_callback_handler, pattern=r"^license_"))
@@ -526,13 +551,9 @@ async def main_async():
 
     jq = app.job_queue
     if jq:
-        # Existing jobs
         jq.run_repeating(check_timeouts, interval=60, first=10)
         jq.run_daily(monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
-
-        # Cleanup jobs
         jq.run_daily(clean_expired_licenses, time=time(hour=3, minute=0, tzinfo=pytz.UTC))
-        # 3-month purge replaces old 7-day clean_old_orders
         jq.run_daily(purge_old_data_job, time=time(hour=4, minute=0, tzinfo=pytz.UTC))
 
     quart_task = asyncio.create_task(run_quart())
