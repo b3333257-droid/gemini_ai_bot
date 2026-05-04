@@ -1,4 +1,4 @@
-# database.py - Fully fixed: string-based diamond field, type-safe, purge etc.
+# database.py - Production-ready: region field, optimized migration, active price index, UTC helper, batch migration, nickname cache TTL, conflict safe migration
 import motor.motor_asyncio
 from datetime import datetime, timedelta
 import pytz
@@ -38,13 +38,35 @@ def _safe_int_or_log(value, name="value"):
 
 
 # ==========================================
-# LicenseCache (unchanged, already safe)
+# 🕒 UTC Timezone Helper
+# ==========================================
+def _ensure_utc(dt):
+    """
+    Convert a datetime (naive or aware, or ISO string) to UTC-aware datetime.
+    Returns None if dt is None or conversion fails.
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace('Z', '+00:00'))
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(dt)
+            except ValueError:
+                logger.error(f"Cannot parse datetime string: {dt!r}")
+                return None
+    if dt.tzinfo is None:
+        dt = UTC_TZ.localize(dt)
+    else:
+        dt = dt.astimezone(UTC_TZ)
+    return dt
+
+
+# ==========================================
+# LicenseCache (unchanged)
 # ==========================================
 class LicenseCache:
-    """
-    လိုင်စင်စစ်ဆေးမှုများကို မှတ်ဉာဏ်ထဲတွင် ခေတ္တသိမ်းဆည်းရန် Cache စနစ်။
-    TTL နှစ်မျိုးသုံးနိုင်သည် - valid တွေ့လျှင် 24h၊ invalid တွေ့လျှင် 5min
-    """
     def __init__(self, cleanup_interval_seconds: int = 3600):
         self.cache: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -94,7 +116,7 @@ class LicenseCache:
             logger.info("LicenseCache cleanup task stopped")
 
     async def get(self, user_id: int) -> Optional[Dict[str, Any]]:
-        user_id = str(user_id)  # works for int/str
+        user_id = str(user_id)
         async with self._lock:
             if user_id in self.cache:
                 data = self.cache[user_id]
@@ -124,13 +146,14 @@ class LicenseCache:
 
 
 # ==========================================
-# DatabaseManager (all type-safe)
+# DatabaseManager (region support, optimized migration, active price index, nickname cache TTL, conflict-safe migration)
 # ==========================================
 class DatabaseManager:
     def __init__(self, uri: str, db_name: str = "DiamondBotDB"):
         try:
             self.client = motor.motor_asyncio.AsyncIOMotorClient(
                 uri,
+                connect=False,
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
                 socketTimeoutMS=20000,
@@ -153,6 +176,8 @@ class DatabaseManager:
         self.settings = self.db['Settings']
         self.licenses = self.db['Licenses']
         self.banned_users = self.db['BannedUsers']
+        # ✅ Nickname cache collection for Name Check API
+        self.nickname_cache = self.db['nickname_cache']
 
         self.license_cache = LicenseCache()
         self._cache_cleanup_started = False
@@ -224,16 +249,26 @@ class DatabaseManager:
                 [("status", 1), ("timestamps.updated_at", 1)],
                 background=True
             )
-            # diamond is now string, unique index still works
             await self.prices.create_index(
                 [("type", 1), ("diamond", 1)],
                 unique=True, background=True
+            )
+            # Active price query index
+            await self.prices.create_index(
+                [("is_active", 1), ("type", 1)],
+                background=True
             )
             await self.licenses.create_index("user_id", unique=True, background=True)
             await self.monthly_reports.create_index(
                 "report_date", expireAfterSeconds=7776000, background=True, name="report_ttl_90d"
             )
             await self.banned_users.create_index("user_id", unique=True, background=True)
+
+            # ✅ Nickname cache TTL index: auto-delete entries older than 24 hours
+            await self.nickname_cache.create_index(
+                "timestamp", expireAfterSeconds=86400, background=True
+            )
+
             logger.info("✅ Database indexes created/verified successfully.")
         except Exception as e:
             logger.error(f"❌ Index setup failed: {e}")
@@ -252,14 +287,18 @@ class DatabaseManager:
     # Order Management
     # ----------------------------------------------------------------------
     async def create_order(self, order_id: str, user_id, profile_name: str,
-                           dia, price_snapshot, item_type: str) -> Optional[dict]:
+                           dia, price_snapshot, item_type: str,
+                           region: str = "Myanmar") -> Optional[dict]:
+        """
+        Create a new order with optional region field.
+        Region defaults to "Myanmar" if not provided.
+        """
         now = datetime.now(UTC_TZ)
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, f"create_order user_id for {order_id}")
         if user_id is None:
             logger.error("Invalid user_id, aborting.")
             return None
 
-        # ✅ Diamond quantity now stored as string to support pass names & numbers
         quantity_str = str(dia) if dia is not None else ""
         price_str = str(price_snapshot) if price_snapshot is not None else ""
 
@@ -272,7 +311,8 @@ class DatabaseManager:
                 "price_snapshot": price_str,
                 "game_id": None,
                 "zone_id": None,
-                "item_type": item_type
+                "item_type": item_type,
+                "region": region
             },
             "status": "pending_id",
             "timestamps": {
@@ -288,7 +328,6 @@ class DatabaseManager:
             return None
 
     async def increment_monthly_count(self, quantity, item_type: str = "dia"):
-        # quantity is now string, no conversion needed
         quantity_str = str(quantity) if quantity is not None else ""
         if not quantity_str:
             return
@@ -336,10 +375,10 @@ class DatabaseManager:
             return 0
 
     # ----------------------------------------------------------------------
-    # License Checking (Core)
+    # License Checking (Core) – using _ensure_utc
     # ----------------------------------------------------------------------
     async def check_license_local(self, user_id) -> Tuple[bool, Optional[datetime]]:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "check_license_local user_id")
         if user_id is None:
             return False, None
         try:
@@ -350,24 +389,16 @@ class DatabaseManager:
         if not doc:
             return False, None
         now_utc = datetime.now(UTC_TZ)
-        expiry = doc["expiry_date"]
-
-        # ✅ FIX: if expiry is a string, convert to datetime
-        if isinstance(expiry, str):
-            try:
-                expiry = datetime.fromisoformat(expiry)
-            except ValueError:
-                logger.error(f"Invalid expiry date format for user {user_id}: {expiry}")
-                return False, None
-
-        if expiry.tzinfo is None:
-            expiry = UTC_TZ.localize(expiry)
+        expiry = _ensure_utc(doc.get("expiry_date"))
+        if expiry is None:
+            logger.error(f"Invalid expiry_date for user {user_id}")
+            return False, None
         return expiry > now_utc, expiry
 
     async def fetch_license_from_master(self, user_id) -> Tuple[bool, Optional[datetime]]:
         if not self.MASTER_API_URL:
             raise ValueError("MASTER_API_URL is not configured")
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "fetch_license_from_master user_id")
         if user_id is None:
             return False, None
         base_url = self.MASTER_API_URL.rstrip('/')
@@ -383,14 +414,7 @@ class DatabaseManager:
                 data = await resp.json()
                 valid = data.get("valid", False)
                 expiry_str = data.get("expiry")
-                expiry = None
-                if expiry_str:
-                    try:
-                        expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-                        if expiry.tzinfo is None:
-                            expiry = UTC_TZ.localize(expiry)
-                    except Exception:
-                        pass
+                expiry = _ensure_utc(expiry_str)
                 return valid, expiry
         except asyncio.TimeoutError:
             raise Exception("Timeout connecting to Master API")
@@ -404,7 +428,7 @@ class DatabaseManager:
             return await self.check_license_local(user_id)
 
     async def is_license_valid(self, user_id) -> bool:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "is_license_valid user_id")
         if user_id is None:
             return False
         if master.MASTER_ID is not None and str(user_id) == str(master.MASTER_ID):
@@ -433,7 +457,7 @@ class DatabaseManager:
             return False
 
     async def force_refresh_license(self, user_id) -> bool:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "force_refresh_license user_id")
         if user_id is None:
             return False
         try:
@@ -451,7 +475,7 @@ class DatabaseManager:
         return valid
 
     async def background_refresh_license(self, user_id):
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "background_refresh_license user_id")
         if user_id is None:
             return
         try:
@@ -465,10 +489,10 @@ class DatabaseManager:
             await self.license_cache.set(user_id, False, None, self.CACHE_TTL_INVALID)
 
     # ----------------------------------------------------------------------
-    # License Management
+    # License Management – using _ensure_utc
     # ----------------------------------------------------------------------
     async def add_or_update_license(self, user_id, months: int):
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "add_or_update_license user_id")
         months = _safe_int_or_log(months, "months")
         if user_id is None or months is None:
             return False
@@ -477,15 +501,9 @@ class DatabaseManager:
             now_utc = datetime.now(UTC_TZ)
             days_to_add = months * 30
             if doc and doc.get("expiry_date"):
-                current_expiry = doc["expiry_date"]
-                # Also handle string here just in case
-                if isinstance(current_expiry, str):
-                    try:
-                        current_expiry = datetime.fromisoformat(current_expiry)
-                    except ValueError:
-                        current_expiry = now_utc
-                if current_expiry.tzinfo is None:
-                    current_expiry = UTC_TZ.localize(current_expiry)
+                current_expiry = _ensure_utc(doc["expiry_date"])
+                if current_expiry is None:
+                    current_expiry = now_utc
                 if current_expiry > now_utc:
                     new_expiry = current_expiry + timedelta(days=days_to_add)
                 else:
@@ -556,14 +574,10 @@ class DatabaseManager:
             logger.error(f"Error deleting order {order_id}: {e}")
 
     # ----------------------------------------------------------------------
-    # Price Management  ✅ ALL STORED AS STRING NOW
+    # Price Management (string-based diamond)
     # ----------------------------------------------------------------------
     @staticmethod
     def _price_sort_key(item: dict):
-        """
-        Sort key for prices: numeric strings by integer value, then non-numeric strings alphabetically (case‑insensitive).
-        Now safe for legacy integer/None diamond values.
-        """
         raw_diamond = item.get("diamond", "")
         diamond = str(raw_diamond) if raw_diamond is not None else ""
         if diamond.isdigit():
@@ -572,7 +586,6 @@ class DatabaseManager:
             return (1, diamond.lower())
 
     async def add_or_update_price(self, diamond, item_type: str = "dia") -> bool:
-        # Store diamond as string (allow numbers + pass names)
         diamond_str = str(diamond) if diamond is not None else ""
         if not diamond_str:
             return False
@@ -591,11 +604,9 @@ class DatabaseManager:
         query = {"is_active": True}
         if item_type:
             query["type"] = item_type
-        # Remove MongoDB sort; we'll sort in Python
         cursor = self.prices.find(query).limit(200)
         try:
             prices = await cursor.to_list(length=200)
-            # Sort: numeric strings first (by integer value), then alphabetical for others
             prices.sort(key=self._price_sort_key)
             return prices
         except Exception as e:
@@ -603,7 +614,6 @@ class DatabaseManager:
             return []
 
     async def get_price_by_amount(self, item_type: str, amount) -> Optional[dict]:
-        # amount is now string, no int conversion
         amount_str = str(amount) if amount is not None else ""
         if not amount_str:
             return None
@@ -714,7 +724,7 @@ class DatabaseManager:
     # Banned Users Management
     # ----------------------------------------------------------------------
     async def ban_user(self, user_id) -> bool:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "ban_user user_id")
         if user_id is None:
             return False
         try:
@@ -730,7 +740,7 @@ class DatabaseManager:
             return False
 
     async def unban_user(self, user_id) -> bool:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "unban_user user_id")
         if user_id is None:
             return False
         try:
@@ -742,7 +752,7 @@ class DatabaseManager:
             return False
 
     async def is_user_banned(self, user_id) -> bool:
-        user_id = _safe_int_or_log(user_id, "user_id")
+        user_id = _safe_int_or_log(user_id, "is_user_banned user_id")
         if user_id is None:
             return False
         return user_id in master.BANNED_USERS
@@ -780,10 +790,8 @@ class DatabaseManager:
             result = await self.orders.aggregate(pipeline).to_list(length=1)
             total_orders = result[0]["total_orders"] if result else 0
 
-            # Fetch prices with monthly_count > 0, sort in Python as well
             cursor = self.prices.find({"monthly_count": {"$gt": 0}}).limit(200)
             prices_data = await cursor.to_list(length=200)
-            # Sort for report display (optional)
             prices_data.sort(key=self._price_sort_key)
 
             items_sold_list = []
@@ -827,25 +835,34 @@ class DatabaseManager:
             return 0, 0
 
     # ----------------------------------------------------------------------
-    # Legacy Data Migration Helper (Run this once if old integer diamonds exist)
+    # Legacy Data Migration (conflict-safe)
     # ----------------------------------------------------------------------
-    async def migrate_legacy_diamond_types(self):
+    async def migrate_legacy_diamond_types(self) -> int:
         """
-        Convert any remaining integer diamond values in Prices collection to strings.
-        Can be triggered from admin panel.
+        Convert non‑string diamond values to strings.
+        Uses $not: {$type: "string"} for efficient filtering.
+        Handles duplicate key conflicts by skipping documents that would cause unique index violations.
         """
         updated = 0
+        skipped = 0
         try:
-            async for doc in self.prices.find({"diamond": {"$exists": True}}):
+            cursor = self.prices.find({"diamond": {"$not": {"$type": "string"}}})
+            async for doc in cursor:
                 diamond = doc.get("diamond")
-                if not isinstance(diamond, str):
-                    new_val = str(diamond) if diamond is not None else ""
+                new_val = str(diamond) if diamond is not None else ""
+                try:
                     await self.prices.update_one(
                         {"_id": doc["_id"]},
                         {"$set": {"diamond": new_val}}
                     )
                     updated += 1
-            logger.info(f"Migrated {updated} non-string diamond values to strings.")
+                except Exception as e:
+                    if "duplicate key error" in str(e).lower():
+                        logger.warning(f"Skipping duplicate diamond value for _id {doc['_id']}: {new_val} already exists")
+                        skipped += 1
+                    else:
+                        raise
+            logger.info(f"Migrated {updated} non‑string diamond values to strings. Skipped {skipped} due to duplicates.")
             return updated
         except Exception as e:
             logger.error(f"Legacy migration error: {e}")
