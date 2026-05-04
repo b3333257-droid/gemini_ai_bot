@@ -1,4 +1,4 @@
-# main.py - Final version with Clickable Owner Name & User ID, full API startup notification, and /fixdb command
+# main.py - Final version with Clickable Owner Name & User ID, full API startup notification, /fixdb command, NAME_CHECK_API support, and 15-min conversation timeout
 import os
 import sys
 import logging
@@ -39,6 +39,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_ID_STR = os.getenv("OWNER_ID")
 API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "").strip()
+NAME_CHECK_API = os.getenv("NAME_CHECK_API", "").strip()
 
 missing_vars = []
 if not BOT_TOKEN:
@@ -81,6 +82,12 @@ logger.info(f"ADMIN_ID: {ADMIN_ID}")
 logger.info(f"MASTER_ID hardcoded: {master.MASTER_ID}")
 logger.info(f"DB Name: DiamondBotDB (URI masked)")
 
+# NAME_CHECK_API ရှိမရှိ အသိပေးချက်
+if not NAME_CHECK_API:
+    logger.warning("NAME_CHECK_API is not set. Name check feature will be disabled.")
+else:
+    logger.info("NAME_CHECK_API loaded successfully.")
+
 # ==========================================
 # 🔌 Modules Linking
 # ==========================================
@@ -94,7 +101,8 @@ from handlers import (
     check_timeouts, paid_command, set_dia_command, set_uc_command,
     delete_dia_command, delete_uc_command, set_welcome_command,
     check_price_command, stop_command, open_command, post_command,
-    active_command, refresh_command, fix_database_command  # ✅ Added
+    active_command, refresh_command, fix_database_command,
+    timeout_handler                     # ✅ 15-min timeout handler added
 )
 
 # ==========================================
@@ -182,6 +190,13 @@ async def post_init(application):
         if not existing_report_month:
             await db.set_config("last_report_month", current_month_str)
             logger.info(f"Initialized last_report_month to {current_month_str}")
+
+        # ✅ NAME_CHECK_API ကို bot_data ထဲသိမ်းဆည်းခြင်း
+        application.bot_data['name_check_api'] = NAME_CHECK_API
+        if NAME_CHECK_API:
+            logger.info(f"Name Check API configured: {NAME_CHECK_API}")
+        else:
+            logger.warning("Name Check API not configured. Skipping name check features.")
 
         logger.info("✅ Database setup completed.")
     except Exception as e:
@@ -519,11 +534,12 @@ async def main_async():
         ("post", post_command),
         ("active", active_command),
         ("refresh", refresh_command),
-        ("fixdb", fix_database_command),  # ✅ Added /fixdb command
+        ("fixdb", fix_database_command),
     ]
     for cmd, handler_func in ADMIN_COMMANDS:
         app.add_handler(CommandHandler(cmd, handler_func))
 
+    # ✅ ConversationHandler with 15‑minute conversation timeout
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
@@ -538,7 +554,9 @@ async def main_async():
         },
         fallbacks=[
             CommandHandler("start", wrap_with_license(send_welcome)),
-        ]
+            MessageHandler(filters.ALL, timeout_handler)   # ✅ timeout fallback
+        ],
+        conversation_timeout=900  # ✅ 15 minutes (in seconds)
     )
     app.add_handler(conv_handler)
 
