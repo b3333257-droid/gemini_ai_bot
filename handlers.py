@@ -1,11 +1,12 @@
-# handlers.py - Final version (Burmese button text, clickable name, fixed admin buttons, migration command)
+# handlers.py - Final complete version (5-min timeout, smart URL, country field, region, cache, license fix, Burmese UI)
 import re
 import asyncio
 import uuid
 import logging
 import html
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from enum import Enum
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError, Forbidden
@@ -146,7 +147,6 @@ def build_admin_caption(order: dict, user_id: int, first_name: str, last_name: s
     quantity_safe = escape_html(str(quantity))
     item_type_safe = escape_html(item_type.upper())
 
-    # ✅ Use safe_user_mention for clickable name
     name_line = f"👤 ဝယ်သူ: {safe_user_mention(user_id, first_name, last_name)}"
     id_line = f'🆔 User ID: <a href="tg://user?id={user_id}">{user_id}</a>'
 
@@ -188,38 +188,105 @@ async def edit_admin_message(query, new_caption: str, reply_markup=None):
     except Exception as e:
         logger.error(f"Error editing admin message: {e}")
 
-# ================== New Helpers for Fixes ==================
-def check_refresh_limit(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Owner တစ်ယောက်ကို ၁ ရက်အတွင်း refresh ၃ ကြိမ်ထက်ပို မခွင့်ပြုပါ။"""
-    today = date.today().isoformat()
-    limits = context.bot_data.setdefault("refresh_limits", {})
-    user_record = limits.get(user_id, {"date": today, "count": 0})
-    if user_record["date"] != today:
-        user_record = {"date": today, "count": 0}
-    if user_record["count"] >= 3:
-        return False
-    user_record["count"] += 1
-    limits[user_id] = user_record
-    return True
-
-def get_remaining_time_str(expiry_date) -> str:
-    """Return human-readable remaining time string (e.g., '2လ 15ရက် ကျန်')"""
-    if not expiry_date:
-        return "N/A"
-    now = datetime.now()
-    diff = expiry_date - now
-    if diff.days < 0:
-        return "Expired"
-    months = diff.days // 30
-    days = diff.days % 30
-    return f"({months}လ {days}ရက်ကျန်)"
-
+# ================== Database Error Helper ==================
 async def _send_db_error(update: Update):
     msg = "⚠️ ဒေတာဘေ့စ် ချိတ်ဆက်မှု မရှိပါ။ ကျေးဇူးပြု၍ ခဏနေမှ ထပ်စမ်းကြည့်ပါ။"
     if update.message:
         await update.message.reply_text(msg)
     elif update.callback_query:
         await update.callback_query.answer(msg, show_alert=True)
+
+# ================== 5-Minute Timeout Handler ==================
+TIMEOUT_SECONDS = 300
+
+async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handle order creation timeout (5 minutes).
+    Sends a timeout message, deletes the order from DB, and clears user_data.
+    """
+    db = get_db(context)
+    order_id = context.user_data.get('current_order_id')
+    if db and order_id:
+        try:
+            await db.delete_order(order_id)
+            logger.info(f"Timeout: Order {order_id} deleted.")
+        except Exception as e:
+            logger.error(f"Timeout: Failed to delete order {order_id}: {e}")
+
+    if update.effective_chat:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⏰ အချိန်ကျော်သွားပါပြီ။ ၅ မိနစ်အတွင်း Game ID ထည့်သွင်းခြင်း မရှိသောကြောင့် အော်ဒါကို ပယ်ဖျက်လိုက်ပါသည်။\nကျေးဇူးပြု၍ /start မှ ပြန်လည်စတင်ပေးပါ။"
+        )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ================== Name Check API & Cache Helpers (region support) ==================
+NICKNAME_CACHE_HOURS = 24
+
+def get_nickname_cache_collection(db):
+    try:
+        return db.db["nickname_cache"]
+    except Exception as e:
+        logger.error(f"Cannot access nickname_cache collection: {e}")
+        return None
+
+async def get_cached_nickname(db, user_id: int, game_id: str, zone_id: str):
+    col = get_nickname_cache_collection(db)
+    if col is None:
+        return None
+    doc = await col.find_one({
+        "user_id": user_id,
+        "game_id": game_id,
+        "zone_id": zone_id
+    })
+    if doc:
+        ts = doc.get("timestamp")
+        if ts and (datetime.utcnow() - ts) < timedelta(hours=NICKNAME_CACHE_HOURS):
+            return doc.get("nickname"), doc.get("region", "Unknown"), ts
+    return None
+
+async def set_cached_nickname(db, user_id: int, game_id: str, zone_id: str, nickname: str, region: str = "Unknown"):
+    col = get_nickname_cache_collection(db)
+    if col is None:
+        return False
+    try:
+        await col.update_one(
+            {"user_id": user_id, "game_id": game_id, "zone_id": zone_id},
+            {"$set": {"nickname": nickname, "region": region, "timestamp": datetime.utcnow()}},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to cache nickname/region: {e}")
+        return False
+
+async def fetch_game_nickname(api_url: str, game_id: str, zone_id: str = "") -> tuple:
+    """
+    Call NAME_CHECK_API and return (nickname, country/region).
+    Handles both {id}/{zone} and USER_ID/ZONE_ID placeholders.
+    API response expected: {"name": "...", "country": "..."}
+    """
+    try:
+        url = api_url
+        if "{id}" in url and "{zone}" in url:
+            url = api_url.format(id=game_id, zone=zone_id)
+        else:
+            url = url.replace("USER_ID", game_id).replace("ZONE_ID", zone_id)
+            url = url.replace("{id}", game_id).replace("{zone}", zone_id)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    nickname = data.get("name", "Unknown")
+                    region = data.get("country", "Unknown")   # API returns "country"
+                    return nickname, region
+                else:
+                    logger.warning(f"Name check API returned status {resp.status}")
+    except Exception as e:
+        logger.error(f"Name check API call failed: {e}")
+    return "N/A", "Unknown"
 
 # ================== User-Facing Handlers ==================
 @handle_errors
@@ -336,6 +403,9 @@ async def step1_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['current_order_id'] = order_id
     context.user_data['item_type'] = item_type
     context.user_data['quantity'] = amount_str
+    # ✅ Save order start time for 5-minute timeout
+    context.user_data['order_start_time'] = datetime.now()
+    # region will be set later after ID check; default "Myanmar" for now
     await db.create_order(order_id, query.from_user.id, query.from_user.first_name, amount_str, 0, item_type)
     if item_type == "uc":
         prompt_text = "🆔 Game ID ရိုက်ထည့်ပါ (ဥပမာ - 123456789)"
@@ -352,6 +422,12 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db:
         await _send_db_error(update)
         return ConversationHandler.END
+
+    # ✅ Check 5-minute timeout
+    order_start = context.user_data.get('order_start_time')
+    if order_start and (datetime.now() - order_start).total_seconds() > TIMEOUT_SECONDS:
+        return await timeout_handler(update, context)
+
     text = update.message.text.strip()
     order_id = context.user_data.get('current_order_id')
     item_type = context.user_data.get('item_type')
@@ -365,19 +441,58 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     validation_result = validate_game_id(item_type, text)
     if validation_result is None:
         if item_type == "dia":
-            await update.message.reply_text("❌ Diamond အတွက် Format: `123456789 1234` (or `123456789(1234)`)")
+            await update.message.reply_text("❌ Diamond အတွက် Format: `123456789 1234`")
         else:
             await update.message.reply_text("❌ UC အတွက် Format: `123456789` (ID တစ်ခုတည်း)")
         return WAIT_GAME_ID
     game_id, zone_id = validation_result
     await db.update_order_game_id(order_id, game_id, zone_id)
+
+    # --- NAME CHECK API / Cache (with region) ---
+    name_check_api = context.bot_data.get('name_check_api')
+    nickname = "N/A"
+    region = "Unknown"
+
+    # ✅ Loading message while checking ID
+    wait_msg = await update.message.reply_text("⏳ Game ID စစ်ဆေးနေပါသည်...")
+
+    try:
+        if name_check_api:
+            cached = await get_cached_nickname(db, update.effective_user.id, game_id, zone_id)
+            if cached:
+                nickname, region, ts = cached
+                logger.debug(f"Using cached nickname/region for {game_id}: {nickname}, {region}")
+            else:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+                nickname, region = await fetch_game_nickname(name_check_api, game_id, zone_id)
+                await set_cached_nickname(db, update.effective_user.id, game_id, zone_id, nickname, region)
+        else:
+            logger.info("NAME_CHECK_API not configured, skipping nickname lookup.")
+    finally:
+        await safe_delete_message(wait_msg, context)
+
+    context.user_data['temp_name'] = nickname
+    context.user_data['temp_region'] = region
+
+    safe_nickname = escape_html(nickname)
     safe_game_id = escape_html(game_id)
     safe_zone_id = escape_html(zone_id) if zone_id else ""
-    confirm_text = f"🆔 Game ID: <b>{safe_game_id}{' (' + safe_zone_id + ')' if zone_id else ''}</b>"
-    await update.message.reply_text(confirm_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ အတည်ပြုမယ်", callback_data="confirm_id"),
-        InlineKeyboardButton("✏️ ID ပြန်ပြင်မယ်", callback_data="back_id")
-    ]]))
+    safe_region = escape_html(region)
+
+    confirm_text = (
+        f"IG Name: <b>{safe_nickname}</b>\n"
+        f"ID     : <b>{safe_game_id}{' (' + safe_zone_id + ')' if zone_id else ''}</b>\n"
+        f"Region : <b>{safe_region}</b>\n\n"
+        f"အချက်အလက် မှန်ကန်ပါက Confirm နှိပ်ပါ"
+    )
+    await update.message.reply_text(
+        confirm_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ အတည်ပြုမယ်", callback_data="confirm_id"),
+            InlineKeyboardButton("✏️ ID ပြန်ပြင်မယ်", callback_data="back_id")
+        ]])
+    )
     return WAIT_CONFIRMATION
 
 @handle_errors
@@ -406,6 +521,12 @@ async def step3_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_GAME_ID
     elif query.data == "confirm_id":
         await db.update_order_status(order_id, OrderStatus.WAITING_PAYMENT)
+        # Update region in order_info if available
+        region = context.user_data.get('temp_region', 'Myanmar')
+        await db.orders.update_one(
+            {"order_id": order_id},
+            {"$set": {"order_info.region": region}}
+        )
         payment_msg_id = await db.get_price_msg_id(item_type, quantity)
         if payment_msg_id:
             try:
@@ -451,7 +572,6 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quantity = context.user_data.get('quantity', 'N/A')
     item_type = context.user_data.get('item_type', 'dia')
 
-    # Caption and buttons for admin
     caption = build_admin_caption(order, user.id, user.first_name, user.last_name,
                                   quantity, item_type, "စစ်ဆေးရန်...")
     admin_markup = InlineKeyboardMarkup([[
@@ -459,7 +579,6 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data=f"admin_reject_{order_id}")
     ]])
 
-    # Send photo with caption and inline buttons directly to admin
     try:
         sent_to_admin = await context.bot.send_photo(
             chat_id=admin_id,
@@ -474,7 +593,7 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Admin ထံ အချက်အလက်ပို့ရာတွင် ချို့ယွင်းသွားပါသည်။ နောက်မှ ထပ်ကြိုးစားပါ။")
         return WAIT_PAYMENT
 
-    # Order summary for the user
+    # User-facing success message
     game_id = order.get("order_info", {}).get("game_id", "N/A")
     zone_id = order.get("order_info", {}).get("zone_id", "")
     if zone_id:
@@ -485,8 +604,7 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Order ID: <code>{escape_html(order_id)}</code>\n"
         f"🆔 Game ID: <b>{game_display}</b>\n"
         f"{'💎' if item_type == 'dia' else '💵'} ပစ္စည်း: <b>{escape_html(quantity)} {item_type.upper()}</b>\n\n"
-        f"✅ <b>လူကြီးမင်း၏ Order တင်မှု အောင်မြင်ပါသည်။</b>\n"
-        f"ငွေလွှဲမှုစစ်ဆေးပြီးပါက Item ထည့်သွင်းပေးပါမည်။ ခေတ္တစောင့်ဆိုင်းပေးပါ။"
+        f"✅ <b>လူကြီးမင်း၏ Order တင်မှု အောင်မြင်ပါသည်။</b>"
     )
     await update.message.reply_text(order_summary, parse_mode="HTML")
     return ConversationHandler.END
@@ -524,12 +642,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     order_info = order.get('order_info', {})
     quantity = order_info.get('quantity', 'N/A')
     item_type = order_info.get('item_type', 'dia')
+
     if data.startswith("admin_approve_"):
         await db.update_order_status(order_id, OrderStatus.PROCESSING)
         await db.increment_monthly_count(quantity, item_type)
         await context.bot.send_message(
             chat_id=user_id_customer,
-            text="✅ Admin မှ ငွေလွှဲမှုကို အတည်ပြုလိုက်ပါပြီ။ ခေတ္တစောင့်ပေးပါ၊ ပစ္စည်းထည့်ပေးနေပါပြီ။"
+            text="✅ Admin မှ ငွေလွှဲမှုကို အတည်ပြုလိုက်ပါပြီ။ ခေတ္တစောင့်ပေးပါ။"
         )
         new_caption = build_admin_caption(order, user_id_customer, first_name, last_name,
                                           quantity, item_type, "⏳ Approved - Waiting for completion")
@@ -650,7 +769,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context):
         await db.set_service_status(False)
-        await update.message.reply_text("🛑 Service ခေတ္တရပ်ထားပါသည် (Maintenance Mode: ON).")
+        await update.message.reply_text("🛑 Service ခေတ္တရပ်ထားပါသည်။")
     else:
         await update.message.reply_text("⛔ အခွင့်အရေးမရှိပါ။")
 
@@ -662,7 +781,7 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if master.is_master(update.effective_user.id) or await is_owner_or_master(update.effective_user.id, context):
         await db.set_service_status(True)
-        await update.message.reply_text("✅ Service ပြန်လည်ဖွင့်လှစ်လိုက်ပါပြီ (Maintenance Mode: OFF).")
+        await update.message.reply_text("✅ Service ပြန်လည်ဖွင့်လှစ်လိုက်ပါပြီ။")
     else:
         await update.message.reply_text("⛔ အခွင့်အရေးမရှိပါ။")
 
@@ -735,7 +854,7 @@ async def set_dia_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if match:
         amount = match.group(1).strip()
         await db.add_or_update_price(amount, "dia")
-        await update.message.reply_text(f"✅ Dia {amount} ထည့်သွင်း/Active လုပ်ပြီးပါပြီ။")
+        await update.message.reply_text(f"✅ Dia {amount} ထည့်သွင်းပြီးပါပြီ။")
     else:
         await update.message.reply_text("❌ Format: /setdia [item_name]")
 
@@ -755,7 +874,7 @@ async def set_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if match:
         amount = match.group(1).strip()
         await db.add_or_update_price(amount, "uc")
-        await update.message.reply_text(f"✅ UC {amount} ထည့်သွင်း/Active လုပ်ပြီးပါပြီ။")
+        await update.message.reply_text(f"✅ UC {amount} ထည့်သွင်းပြီးပါပြီ။")
     else:
         await update.message.reply_text("❌ Format: /setuc [item_name]")
 
@@ -772,7 +891,7 @@ async def delete_dia_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည် ထည့်ပါ။ e.g. /deletedia Weekly Pass")
         return
     await db.set_price_active("dia", amount, False)
-    await update.message.reply_text(f"✅ Dia {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
+    await update.message.reply_text(f"✅ Dia {amount} ကိုဖျက်ပြီးပါပြီ။")
 
 @handle_errors
 async def delete_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -787,7 +906,7 @@ async def delete_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ဖျက်ရန် ပစ္စည်းအမည် ထည့်ပါ။ e.g. /deleteuc Weekly Pass")
         return
     await db.set_price_active("uc", amount, False)
-    await update.message.reply_text(f"✅ UC {amount} ကို Inactive ပြုလုပ်ပြီးပါပြီ။")
+    await update.message.reply_text(f"✅ UC {amount} ကိုဖျက်ပြီးပါပြီ။")
 
 @handle_errors
 async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -845,7 +964,7 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = lic["user_id"]
         expiry = lic.get("expiry_date")
         time_left = get_remaining_time_str(expiry)
-        keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"lic_view_{uid}")])
+        keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"license_view_{uid}")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(text, parse_mode=ADMIN_PARSE_MODE, reply_markup=reply_markup)
 
@@ -862,7 +981,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     data = query.data
 
-    if data.startswith("lic_view_"):
+    if data.startswith("license_view_"):
         target_id = int(data.split("_")[-1])
         lic = await db.licenses.find_one({"user_id": target_id})
         if not lic:
@@ -877,29 +996,29 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         )
         keyboard = [
             [
-                InlineKeyboardButton("➕ 1 လတိုး", callback_data=f"lic_add_1_{target_id}"),
-                InlineKeyboardButton("➕ 3 လတိုး", callback_data=f"lic_add_3_{target_id}")
+                InlineKeyboardButton("➕ 1 လတိုး", callback_data=f"license_add_1_{target_id}"),
+                InlineKeyboardButton("➕ 3 လတိုး", callback_data=f"license_add_3_{target_id}")
             ],
-            [InlineKeyboardButton("🚫 လိုင်စင်ပိတ်မယ်", callback_data=f"lic_revoke_{target_id}")],
-            [InlineKeyboardButton("🔙 စာရင်းသို့", callback_data="lic_main_list")]
+            [InlineKeyboardButton("🚫 လိုင်စင်ပိတ်မယ်", callback_data=f"license_revoke_{target_id}")],
+            [InlineKeyboardButton("🔙 စာရင်းသို့", callback_data="license_main_list")]
         ]
         await query.edit_message_text(text, parse_mode=ADMIN_PARSE_MODE, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    elif data == "lic_main_list":
+    elif data == "license_main_list":
         licenses = await db.get_all_licenses()
         keyboard = []
         for lic in licenses:
             uid = lic["user_id"]
             expiry = lic.get("expiry_date")
             time_left = get_remaining_time_str(expiry)
-            keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"lic_view_{uid}")])
+            keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}", callback_data=f"license_view_{uid}")])
         await query.edit_message_text(
             "📋 <b>လိုင်စင်စာရင်း</b>",
             parse_mode=ADMIN_PARSE_MODE,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    elif data.startswith("lic_add_") or data.startswith("lic_revoke_"):
+    elif data.startswith("license_add_") or data.startswith("license_revoke_"):
         parts = data.split("_")
         if len(parts) < 4:
             return
@@ -913,8 +1032,32 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
             target_id = int(parts[2])
             await db.licenses.delete_one({"user_id": target_id})
             await query.answer("❌ လိုင်စင်ဖျက်သိမ်းပြီးပါပြီ", show_alert=True)
-        query.data = f"lic_view_{target_id}"
+        query.data = f"license_view_{target_id}"
         await license_callback_handler(update, context)
+
+# ================== Refresh Command ==================
+def get_remaining_time_str(expiry_date) -> str:
+    if not expiry_date:
+        return "N/A"
+    now = datetime.now()
+    diff = expiry_date - now
+    if diff.days < 0:
+        return "Expired"
+    months = diff.days // 30
+    days = diff.days % 30
+    return f"({months}လ {days}ရက်ကျန်)"
+
+def check_refresh_limit(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    today = date.today().isoformat()
+    limits = context.bot_data.setdefault("refresh_limits", {})
+    user_record = limits.get(user_id, {"date": today, "count": 0})
+    if user_record["date"] != today:
+        user_record = {"date": today, "count": 0}
+    if user_record["count"] >= 3:
+        return False
+    user_record["count"] += 1
+    limits[user_id] = user_record
+    return True
 
 @handle_errors
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -954,7 +1097,7 @@ async def check_timeouts(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Timeout check error: {e}")
 
-# ================== Database Migration Command (Master Only) ==================
+# ================== Database Migration Command ==================
 @handle_errors
 async def fix_database_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
@@ -962,12 +1105,10 @@ async def fix_database_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await _send_db_error(update)
         return
 
-    # Bot Owner (Master) ဟုတ်မဟုတ် အရင်စစ်မယ်
     if not master.is_master(update.effective_user.id):
         await update.message.reply_text("⛔ ဒီခလုတ်ကို သုံးပိုင်ခွင့်မရှိပါ။")
         return
 
-    # ဒေတာဟောင်းတွေကို အသစ်ဖြစ်အောင် စတင်ပြင်ဆင်မယ်
     count = await db.migrate_legacy_diamond_types()
 
     if count == -1:
