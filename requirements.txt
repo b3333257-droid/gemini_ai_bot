@@ -1,7 +1,18 @@
+# Telegram Bot & Tasks
 python-telegram-bot[job-queue]>=21.0
+pytz>=2024.1
+python-dateutil>=2.9.0
+
+# Database (MongoDB)
 motor>=3.3.0
 dnspython>=2.6.0
-pytz>=2024.1
-quart>=0.19.0
-python-dotenv>=1.0.1
+
+# API & Web Server
 aiohttp>=3.9.0
+quart>=0.19.0
+
+# Environment & Utils
+python-dotenv>=1.0.1
+
+# Performance Optimization (Linux/Unix-based servers only)
+uvloop>=0.19.0; sys_platform != 'win32'
