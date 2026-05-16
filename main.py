@@ -601,7 +601,6 @@ async def main_async():
 
     quart_ready_event.clear()
 
-    # PTB v20+ compatible ApplicationBuilder (connect_retries removed)
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
            .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
@@ -612,103 +611,106 @@ async def main_async():
            .build()
     )
 
-    if not await init_database(app):
-        logger.critical("Database initialization failed. Exiting.")
-        return
-
-    quart_app.config['ADMIN_ID'] = PRIMARY_ADMIN_ID
-    quart_app.config['API_SECRET_TOKEN'] = API_SECRET_TOKEN
-
-    await setup_jobs(app)
-
-    admin_commands = [
-        ("setdia", set_dia_command),
-        ("setuc", set_uc_command),
-        ("deletedia", delete_dia_command),
-        ("deleteuc", delete_uc_command),
-        ("setwelcome", set_welcome_command),
-        ("check", check_price_command),
-        ("stop", stop_command),
-        ("open", open_command),
-        ("post", post_command),
-        ("active", active_command),
-        ("refresh", refresh_command),
-        ("fixdb", fix_database_command),
-    ]
-    for cmd, func in admin_commands:
-        app.add_handler(CommandHandler(cmd, admin_only(func)))
-
-    app.add_handler(CommandHandler("paid", master_paid_command))
-    app.add_handler(CommandHandler("license", master_license_add_command))
-
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
-            CallbackQueryHandler(wrap_with_license(show_items), pattern=r"^(show_dia|show_uc)$"),
-            CallbackQueryHandler(wrap_with_license(send_welcome), pattern=r"^back_to_main$"),
-            CommandHandler("start", wrap_with_license(send_welcome)),
-        ],
-        states={
-            WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_with_license(step2_id_entry))],
-            WAIT_CONFIRMATION: [CallbackQueryHandler(wrap_with_license(step3_validation), pattern="^(confirm_id|back_id)$")],
-            WAIT_PAYMENT: [MessageHandler(filters.PHOTO, wrap_with_license(step4_payment))],
-        },
-        fallbacks=[
-            CommandHandler("start", wrap_with_license(send_welcome)),
-            MessageHandler(filters.TEXT | filters.PHOTO, timeout_handler),
-        ],
-        conversation_timeout=CONVERSATION_TIMEOUT,
-        name="order_conversation",
-        persistent=False,
-    )
-    app.add_handler(conv_handler)
-
-    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin_"))
-    app.add_handler(CallbackQueryHandler(user_cancel_handler, pattern=r"^cancel_user_"))
-    app.add_handler(CallbackQueryHandler(license_callback_handler, pattern=r"^license_"))
-    app.add_handler(CallbackQueryHandler(wrap_with_license(new_order_callback_handler), pattern=r"^new_order$"))
-
-    app.add_error_handler(global_error_handler)
-
-    quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
-    quart_thread.start()
-
-    asyncio.create_task(_monitor_quart_thread())
-
-    ready = await asyncio.to_thread(quart_ready_event.wait, QUART_READY_TIMEOUT)
-    if not ready:
-        logger.warning("Quart DB did not become ready in time; health check may show down.")
-
-    await app.initialize()
-    await app.start()
-    # Polling with Update.ALL_TYPES (compatible with all PTB v20+ versions)
-    await app.updater.start_polling(
-        drop_pending_updates=False,
-        allowed_updates=Update.ALL_TYPES
-    )
-    logger.info("Bot polling started.")
-    bot_running = True
-
-    asyncio.create_task(_notify_startup_task(app))
-
-    shutdown_event = asyncio.Event()
-
-    def signal_handler():
-        logger.info("Received termination signal. Initiating shutdown...")
-        shutdown_event.set()
-
     try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
-    except NotImplementedError:
-        pass
+        # ---------- Startup ----------
+        if not await init_database(app):
+            logger.critical("Database initialization failed. Exiting.")
+            return
 
-    try:
-        await shutdown_event.wait()
-    except asyncio.CancelledError:
-        pass
+        quart_app.config['ADMIN_ID'] = PRIMARY_ADMIN_ID
+        quart_app.config['API_SECRET_TOKEN'] = API_SECRET_TOKEN
+
+        await setup_jobs(app)
+
+        admin_commands = [
+            ("setdia", set_dia_command),
+            ("setuc", set_uc_command),
+            ("deletedia", delete_dia_command),
+            ("deleteuc", delete_uc_command),
+            ("setwelcome", set_welcome_command),
+            ("check", check_price_command),
+            ("stop", stop_command),
+            ("open", open_command),
+            ("post", post_command),
+            ("active", active_command),
+            ("refresh", refresh_command),
+            ("fixdb", fix_database_command),
+        ]
+        for cmd, func in admin_commands:
+            app.add_handler(CommandHandler(cmd, admin_only(func)))
+
+        app.add_handler(CommandHandler("paid", master_paid_command))
+        app.add_handler(CommandHandler("license", master_license_add_command))
+
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
+                CallbackQueryHandler(wrap_with_license(show_items), pattern=r"^(show_dia|show_uc)$"),
+                CallbackQueryHandler(wrap_with_license(send_welcome), pattern=r"^back_to_main$"),
+                CommandHandler("start", wrap_with_license(send_welcome)),
+            ],
+            states={
+                WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_with_license(step2_id_entry))],
+                WAIT_CONFIRMATION: [CallbackQueryHandler(wrap_with_license(step3_validation), pattern="^(confirm_id|back_id)$")],
+                WAIT_PAYMENT: [MessageHandler(filters.PHOTO, wrap_with_license(step4_payment))],
+            },
+            fallbacks=[
+                CommandHandler("start", wrap_with_license(send_welcome)),
+                MessageHandler(filters.TEXT | filters.PHOTO, timeout_handler),
+            ],
+            conversation_timeout=CONVERSATION_TIMEOUT,
+            name="order_conversation",
+            persistent=False,
+        )
+        app.add_handler(conv_handler)
+
+        app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin_"))
+        app.add_handler(CallbackQueryHandler(user_cancel_handler, pattern=r"^cancel_user_"))
+        app.add_handler(CallbackQueryHandler(license_callback_handler, pattern=r"^license_"))
+        app.add_handler(CallbackQueryHandler(wrap_with_license(new_order_callback_handler), pattern=r"^new_order$"))
+
+        app.add_error_handler(global_error_handler)
+
+        quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
+        quart_thread.start()
+
+        asyncio.create_task(_monitor_quart_thread())
+
+        ready = await asyncio.to_thread(quart_ready_event.wait, QUART_READY_TIMEOUT)
+        if not ready:
+            logger.warning("Quart DB did not become ready in time; health check may show down.")
+
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            drop_pending_updates=False,
+            allowed_updates=Update.ALL_TYPES
+        )
+        logger.info("Bot polling started.")
+        bot_running = True
+
+        asyncio.create_task(_notify_startup_task(app))
+
+        shutdown_event = asyncio.Event()
+
+        def signal_handler():
+            logger.info("Received termination signal. Initiating shutdown...")
+            shutdown_event.set()
+
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            pass
+
+        try:
+            await shutdown_event.wait()
+        except asyncio.CancelledError:
+            pass
+
     finally:
+        # ---------- Shutdown cleanup ----------
         logger.info("Shutting down…")
         bot_running = False
 
@@ -724,15 +726,29 @@ async def main_async():
             await asyncio.to_thread(quart_thread.join, 5)
 
         http_session = app.bot_data.get('http_session')
-        if http_session:
+        if http_session and not http_session.closed:
             try:
                 await asyncio.wait_for(http_session.close(), timeout=HTTP_SESSION_CLOSE_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning("HTTP session close timed out.")
+                logger.info("HTTP session closed.")
+            except Exception as e:
+                logger.warning(f"HTTP session close failed: {e}")
 
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        # Safe stop – may fail if app not fully initialized
+        try:
+            if app.updater and app.updater.running:
+                await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            if app.running:
+                await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+
         logger.info("Bot shutdown complete.")
 
 def main():
