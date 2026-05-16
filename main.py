@@ -13,6 +13,7 @@ main.py – Production‑ready bot entry point (Render‑optimized).
 - Non-blocking thread join.
 - Background Quart thread health monitor.
 - Safe for external supervisor (Render auto-restart) – no internal restart loop.
+- Startup notification sent only once per process lifetime (guard flag).
 """
 
 import os
@@ -298,9 +299,19 @@ async def purge_old_data_job(context):
             logger.info(f"3‑month purge: {del_reports} reports removed.")
 
 # ──────────────────────────────────────
-# Startup Notifications (safe, no crash)
+# Startup Notifications (with duplicate guard)
 # ──────────────────────────────────────
+# Global flag to ensure startup notification runs exactly once per process lifetime.
+_startup_notification_sent = False
+
 async def _notify_startup_task(app):
+    global _startup_notification_sent
+    # Double-check guard (in case of parallel calls, though unlikely)
+    if _startup_notification_sent:
+        logger.debug("Startup notification already sent; skipping duplicate call.")
+        return
+    _startup_notification_sent = True
+
     try:
         bot = app.bot
         owner_name = "Admin"
@@ -324,6 +335,7 @@ async def _notify_startup_task(app):
         )
         await bot.send_message(chat_id=PRIMARY_ADMIN_ID, text=owner_msg, parse_mode="HTML")
 
+        # Notify master if this is a client bot (owner != master)
         if MASTER_ID != PRIMARY_ADMIN_ID:
             master_msg = (
                 f"🔔 <b>Client Bot Started</b>\n\n"
@@ -341,8 +353,11 @@ async def _notify_startup_task(app):
         db = app.bot_data.get('db')
         if db and db.license_repo.client_mode:
             http_session = app.bot_data.get('http_session')
-            await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
-                                     PRIMARY_ADMIN_ID, http_session)
+            # Use attribute on app to avoid duplicate API call within same run
+            if not getattr(app, '_master_api_notified', False):
+                app._master_api_notified = True
+                await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
+                                         PRIMARY_ADMIN_ID, http_session)
     except Exception as e:
         logger.error(f"Startup notification task failed: {e}")
 
@@ -390,7 +405,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         logger.error("Global error: unknown error")
 
 # ──────────────────────────────────────
-# Quart Web Server (live DB check, IP fix, rate limit memory cleanup with task cancel)
+# Quart Web Server (no changes needed)
 # ──────────────────────────────────────
 quart_app = Quart(__name__)
 
@@ -597,8 +612,10 @@ async def _monitor_quart_thread():
             logger.critical("Quart thread is not alive! Health check will fail.")
 
 async def main_async():
-    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event
+    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, _startup_notification_sent
 
+    # Reset guard for each run (but this is inside main_async which runs once)
+    _startup_notification_sent = False
     quart_ready_event.clear()
 
     app = (ApplicationBuilder()
@@ -689,7 +706,9 @@ async def main_async():
         logger.info("Bot polling started.")
         bot_running = True
 
-        asyncio.create_task(_notify_startup_task(app))
+        # Send startup notification exactly once (guard ensures it)
+        if not _startup_notification_sent:
+            asyncio.create_task(_notify_startup_task(app))
 
         shutdown_event = asyncio.Event()
 
