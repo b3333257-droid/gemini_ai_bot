@@ -1,15 +1,34 @@
-# main.py - Final version with Clickable Owner Name & User ID, full API startup notification, /fixdb command, NAME_CHECK_API support, and 15-min conversation timeout
+# main.py (အစအဆုံး)
+"""
+main.py – Production‑ready bot entry point (Render‑optimized).
+- Master ID from hardcoded master.py.
+- Quart web server runs in separate thread with lightweight Motor client.
+- Hypercorn ASGI server.
+- Graceful shutdown using asyncio.Event + signal handlers.
+- No cross‑thread Telegram bot object usage.
+- Rate limited license check API with IP leak prevention and periodic memory cleanup.
+- Enhanced health check with live DB ping.
+- Race condition mitigation via threading.Event for Quart DB ready.
+- Polling conflict protection.
+- Non-blocking thread join.
+- Background Quart thread health monitor.
+- Safe for external supervisor (Render auto-restart) – no internal restart loop.
+"""
+
 import os
 import sys
+import asyncio
 import logging
 import html
-import asyncio
-import time as _time
+import signal
+import threading
 from datetime import datetime, time, timedelta
+from functools import wraps
 from logging.handlers import RotatingFileHandler
 
 import pytz
 import aiohttp
+import motor.motor_asyncio
 from quart import Quart, jsonify, request
 from telegram import Update
 from telegram.ext import (
@@ -21,80 +40,24 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import Conflict
 
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+
+# Load .env if available
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    logger_loading = logging.getLogger(__name__)
-    logger_loading.info(".env file loaded (python-dotenv)")
 except ImportError:
     pass
 
 import master
-
-# ==========================================
-# 🔒 Environment Variables & Validation
-# ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-ADMIN_ID_STR = os.getenv("OWNER_ID")
-API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "").strip()
-NAME_CHECK_API = os.getenv("NAME_CHECK_API", "").strip()
-
-missing_vars = []
-if not BOT_TOKEN:
-    missing_vars.append("BOT_TOKEN")
-if not MONGO_URI:
-    missing_vars.append("MONGO_URI")
-if not ADMIN_ID_STR:
-    missing_vars.append("OWNER_ID")
-if not API_SECRET_TOKEN:
-    missing_vars.append("API_SECRET_TOKEN")
-
-if missing_vars:
-    raise ValueError(f"⚠️ Missing required environment variables: {', '.join(missing_vars)}")
-
-try:
-    ADMIN_ID = int(ADMIN_ID_STR)
-except ValueError:
-    raise ValueError("⚠️ OWNER_ID must be an integer.")
-
-# ✅ Master ID hardcoded
-master.MASTER_ID = 6510049765
-
-# ==========================================
-# 📝 Logging Configuration
-# ==========================================
-LOG_FILE = "bot.log"
-MAX_LOG_SIZE = 5 * 1024 * 1024
-BACKUP_COUNT = 3
-
-log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_format)
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT, encoding='utf-8')
-file_handler.setFormatter(log_format)
-logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler])
-logger = logging.getLogger(__name__)
-
-logger.info("=== Bot Starting ===")
-logger.info(f"ADMIN_ID: {ADMIN_ID}")
-logger.info(f"MASTER_ID hardcoded: {master.MASTER_ID}")
-logger.info(f"DB Name: DiamondBotDB (URI masked)")
-
-# NAME_CHECK_API ရှိမရှိ အသိပေးချက်
-if not NAME_CHECK_API:
-    logger.warning("NAME_CHECK_API is not set. Name check feature will be disabled.")
-else:
-    logger.info("NAME_CHECK_API loaded successfully.")
-
-# ==========================================
-# 🔌 Modules Linking
-# ==========================================
+from master import _REAL_MASTER_ID as MASTER_ID
 from database import DatabaseManager, UTC_TZ
 import handlers
 from handlers import (
-    WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT, wrap_with_license,
+    WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT,
     send_welcome, show_items, step1_selection, step2_id_entry,
     step3_validation, step4_payment, admin_callback_handler,
     user_cancel_handler, license_callback_handler, new_order_callback_handler,
@@ -102,349 +65,509 @@ from handlers import (
     delete_dia_command, delete_uc_command, set_welcome_command,
     check_price_command, stop_command, open_command, post_command,
     active_command, refresh_command, fix_database_command,
-    timeout_handler                     # ✅ 15-min timeout handler added
+    timeout_handler, wrap_with_license
 )
 
-# ==========================================
-# 🛡 Startup Access Guard (send to OWNER only)
-# ==========================================
-async def check_startup_access(app) -> bool:
-    """Send startup notification to ADMIN_ID (owner) only."""
+# ──────────────────────────────────────
+# Logging Setup (duplication‑free, Render‑friendly)
+# ──────────────────────────────────────
+LOG_FILE = "bot.log"
+MAX_LOG_SIZE = 3 * 1024 * 1024
+BACKUP_COUNT = 1
+PORT = int(os.environ.get("PORT", 8080))
+
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console = logging.StreamHandler()
+console.setFormatter(log_format)
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=BACKUP_COUNT, encoding='utf-8')
+file_handler.setFormatter(log_format)
+logging.basicConfig(level=logging.INFO, handlers=[console, file_handler])
+logger = logging.getLogger(__name__)
+# propagates to root handlers automatically
+
+# ──────────────────────────────────────
+# Environment & Configuration
+# ──────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME", "DiamondBotDB")
+ADMIN_ID_STR = os.getenv("OWNER_ID")
+API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "").strip()
+NAME_CHECK_API = os.getenv("NAME_CHECK_API", "").strip()
+EXTRA_ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "").strip()
+
+REQUIRED_VARS = {
+    "BOT_TOKEN": BOT_TOKEN,
+    "MONGO_URI": MONGO_URI,
+    "OWNER_ID": ADMIN_ID_STR,
+    "API_SECRET_TOKEN": API_SECRET_TOKEN,
+}
+
+missing_env = [k for k, v in REQUIRED_VARS.items() if not v]
+if missing_env:
+    print(f"Missing required environment variables: {', '.join(missing_env)}", file=sys.stderr)
+    sys.exit(1)
+
+if len(API_SECRET_TOKEN) < 16:
+    logger.warning("⚠️ API_SECRET_TOKEN is too short (<16 chars). This is a security risk!")
+
+try:
+    PRIMARY_ADMIN_ID = int(ADMIN_ID_STR)
+except ValueError:
+    logger.error("OWNER_ID must be an integer.")
+    sys.exit(1)
+
+extra_admin_ids = []
+if EXTRA_ADMIN_IDS_STR:
     try:
-        # Fetch owner info
-        try:
-            owner_chat = await app.bot.get_chat(ADMIN_ID)
-            owner_name = owner_chat.first_name or owner_chat.username or str(ADMIN_ID)
-        except Exception as e:
-            logger.warning(f"Could not fetch owner chat info: {e}. Using fallback 'Admin'.")
-            owner_name = "Admin"
-
-        safe_owner_name = html.escape(owner_name)
-        owner_id_link = f'<a href="tg://user?id={ADMIN_ID}">{ADMIN_ID}</a>'
-
-        bot_info = await app.bot.get_me()
-        bot_username = f"@{bot_info.username}" if bot_info.username else "N/A"
-
-        mmt_tz = pytz.timezone('Asia/Yangon')
-        mmt_now = datetime.now(mmt_tz)
-        time_str = mmt_now.strftime('%Y-%m-%d %H:%M:%S (MMT)')
-
-        startup_msg = (
-            f"✅ <b>Bot Started Successfully</b>\n\n"
-            f"👤 <b>Owner:</b> {safe_owner_name}\n"
-            f"🆔 <b>Owner ID:</b> {owner_id_link}\n"
-            f"🤖 <b>Bot:</b> {bot_username}\n"
-            f"🕒 <b>Time:</b> {time_str}\n\n"
-            f"Bot is now running and accepting commands."
-        )
-
-        # Only send to ADMIN_ID (owner of this client bot)
-        try:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=startup_msg,
-                parse_mode="HTML"
-            )
-            logger.info(f"Startup notification sent to ADMIN {ADMIN_ID}")
-        except Exception as e:
-            logger.warning(f"Could not send startup notification to ADMIN {ADMIN_ID}: {e}")
-
-        return True
-    except Exception as e:
-        logger.error(f"Failed to prepare startup notification: {e}")
-        return True
-
-
-# ==========================================
-# ⚡ Post Init Hook
-# ==========================================
-async def post_init(application):
-    try:
-        db = DatabaseManager(uri=MONGO_URI)
-        db.set_admin_id(ADMIN_ID)
-        application.bot_data['db'] = db
-        application.bot_data['admin_id'] = ADMIN_ID
-        quart_app.config['db'] = db
-        quart_app.config['ADMIN_ID'] = ADMIN_ID
-        quart_app.config['bot'] = application.bot
-        db.start_cache_cleanup()
-
-        logger.info("Checking MongoDB connection...")
-        if not await db.ping():
-            logger.critical("❌ MongoDB ping failed.")
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="🚨 MongoDB ချိတ်ဆက်မှု မအောင်မြင်ပါ။"
-            )
-            sys.exit(1)
-
-        logger.info("Initializing Database Indexes...")
-        await db.setup_indexes()
-
-        # Load banned users list from DB into memory
-        await master.load_banned_users_from_db(db)
-
-        # Initialize last_report_month config
-        current_month_str = datetime.now(UTC_TZ).strftime("%Y-%m")
-        existing_report_month = await db.get_config("last_report_month")
-        if not existing_report_month:
-            await db.set_config("last_report_month", current_month_str)
-            logger.info(f"Initialized last_report_month to {current_month_str}")
-
-        # ✅ NAME_CHECK_API ကို bot_data ထဲသိမ်းဆည်းခြင်း
-        application.bot_data['name_check_api'] = NAME_CHECK_API
-        if NAME_CHECK_API:
-            logger.info(f"Name Check API configured: {NAME_CHECK_API}")
-        else:
-            logger.warning("Name Check API not configured. Skipping name check features.")
-
-        logger.info("✅ Database setup completed.")
-    except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        try:
-            await application.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ DB Connection Failed: {e}")
-        except:
-            pass
+        extra_admin_ids = [int(x.strip()) for x in EXTRA_ADMIN_IDS_STR.split(",") if x.strip()]
+    except ValueError:
+        logger.error("❌ ADMIN_IDS contains invalid integers.")
         sys.exit(1)
 
-    await check_startup_access(application)
+ALL_ADMIN_IDS = [PRIMARY_ADMIN_ID] + extra_admin_ids
 
-    # Notify Master server about client startup via API (with details)
-    db_instance = application.bot_data.get('db')
-    if db_instance and db_instance.is_client_mode:
-        await notify_master_startup(application.bot, db_instance.MASTER_API_URL,
-                                    db_instance.API_SECRET_TOKEN, ADMIN_ID)
+# ──────────────────────────────────────
+# Constants
+# ──────────────────────────────────────
+CONVERSATION_TIMEOUT = 900
+HTTP_TIMEOUT = 10
+DB_PING_RETRIES = 3
+DB_PING_RETRY_DELAY = 5
+HTTP_SESSION_CLOSE_TIMEOUT = 5.0
+QUART_SHUTDOWN_TIMEOUT = 10.0
+RATE_LIMIT_MAX = 10
+RATE_LIMIT_WINDOW = 60
+QUART_READY_TIMEOUT = 10  # seconds to wait for Quart DB init
+RATE_LIMIT_CLEANUP_INTERVAL = 300  # 5 minutes
 
+# Telegram connection settings (PTB v20+)
+TELEGRAM_CONNECT_TIMEOUT = 10.0
+TELEGRAM_READ_TIMEOUT = 30.0
+TELEGRAM_WRITE_TIMEOUT = 30.0
+TELEGRAM_CONNECTION_POOL_SIZE = 256
+TELEGRAM_POOL_TIMEOUT = 1.0
+
+logger.info("=== Bot Starting ===")
+logger.info(f"PRIMARY ADMIN ID: {PRIMARY_ADMIN_ID}")
+logger.info(f"MASTER_ID (hardcoded): {MASTER_ID}")
+logger.info(f"All admin IDs: {ALL_ADMIN_IDS}")
+if NAME_CHECK_API:
+    logger.info("NAME_CHECK_API loaded.")
+else:
+    logger.warning("NAME_CHECK_API not set; name check disabled.")
+
+# ──────────────────────────────────────
+# Access Control Decorators
+# ──────────────────────────────────────
+def role_required(role: str = "admin"):
+    def decorator(handler_func):
+        @wraps(handler_func)
+        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if update.effective_user is None:
+                return
+            user_id = update.effective_user.id
+            allowed = master.is_master(user_id) if role == "master" else master.is_admin(user_id)
+            if not allowed:
+                msg = "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
+                if update.message:
+                    await update.message.reply_text(msg)
+                elif update.callback_query:
+                    try:
+                        await update.callback_query.answer(msg, show_alert=True)
+                    except Exception:
+                        pass
+                return
+            return await handler_func(update, context)
+        return wrapped
+    return decorator
+
+master_only = role_required("master")
+admin_only  = role_required("admin")
+
+# ──────────────────────────────────────
+# Database & Session Initialization (Main Bot)
+# ──────────────────────────────────────
+async def init_database(application):
+    master.initialize_master(admin_ids=ALL_ADMIN_IDS)
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    http_session = aiohttp.ClientSession(timeout=timeout)
+    application.bot_data['http_session'] = http_session
+
+    db = DatabaseManager(
+        uri=MONGO_URI,
+        db_name=DB_NAME,
+        http_session=http_session,
+        primary_admin_id=PRIMARY_ADMIN_ID
+    )
+    application.bot_data['db'] = db
+    application.bot_data['admin_id'] = PRIMARY_ADMIN_ID
+
+    ping_ok = False
+    for attempt in range(1, DB_PING_RETRIES + 1):
+        if await db.ping():
+            ping_ok = True
+            break
+        logger.warning(f"MongoDB ping attempt {attempt} failed. Retrying…")
+        await asyncio.sleep(DB_PING_RETRY_DELAY)
+
+    if not ping_ok:
+        logger.critical("MongoDB ping failed after multiple attempts.")
+        try:
+            await application.bot.send_message(chat_id=PRIMARY_ADMIN_ID, text="🚨 MongoDB ချိတ်ဆက်မှု မအောင်မြင်ပါ။")
+        except Exception:
+            pass
+        await http_session.close()
+        return False
+
+    db.start_cache_cleanup()
+    logger.info("Setting up indexes…")
+    await db.setup_indexes()
+    await db.banned_repo.load_banned_users_from_db()
+
+    now = datetime.now(UTC_TZ)
+    current_month = now.strftime("%Y-%m")
+    if not await db.settings_repo.get_config("last_report_month"):
+        await db.settings_repo.set_config("last_report_month", current_month)
+
+    await db.license_repo.background_refresh(PRIMARY_ADMIN_ID)
+    application.bot_data['name_check_api'] = NAME_CHECK_API
+    if NAME_CHECK_API:
+        logger.info("Name Check API configured.")
+    return True
+
+# ──────────────────────────────────────
+# Background Jobs
+# ──────────────────────────────────────
+async def setup_jobs(application):
     jq = application.job_queue
-    if jq and db_instance.is_client_mode:
-        async def license_refresh_job(context: ContextTypes.DEFAULT_TYPE):
-            db_inner = context.bot_data.get('db')
-            admin = context.bot_data.get('admin_id', ADMIN_ID)
-            if db_inner:
-                await db_inner.background_refresh_license(admin)
-                logger.debug("Background license refresh completed.")
+    if not jq:
+        logger.critical("❌ PTB JobQueue not available! Background tasks will NOT run.")
+        return
+    jq.run_repeating(check_timeouts, interval=60, first=10)
+    jq.run_daily(monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
+    jq.run_daily(clean_expired_licenses, time=time(hour=3, minute=0, tzinfo=pytz.UTC))
+    jq.run_daily(purge_old_data_job, time=time(hour=4, minute=0, tzinfo=pytz.UTC))
 
-        jq.run_repeating(
-            license_refresh_job,
-            interval=24 * 60 * 60,
-            first=60 * 60,
-            name="license_background_refresh"
-        )
-        logger.info("Client mode: Background license refresh scheduled every 24h.")
+    db = application.bot_data.get('db')
+    if db and db.license_repo.client_mode:
+        async def license_refresh(context):
+            dbi = context.bot_data.get('db')
+            adm = context.bot_data.get('admin_id')
+            if dbi and adm:
+                await dbi.license_repo.background_refresh(adm)
+        jq.run_repeating(license_refresh, interval=24*60*60, first=60*60)
 
-
-# ==========================================
-# 📊 Monthly Report Job
-# ==========================================
-async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE):
+async def monthly_report_job(context):
     db = context.bot_data.get('db')
-    admin_id = context.bot_data.get('admin_id', ADMIN_ID)
-    if db is None:
+    admin_id = context.bot_data.get('admin_id')
+    if not db:
         return
     now = datetime.now(UTC_TZ)
-    current_month_str = now.strftime("%Y-%m")
-    last_report_month = await db.get_config("last_report_month")
-    if not last_report_month:
-        await db.set_config("last_report_month", current_month_str)
+    current_month = now.strftime("%Y-%m")
+    last_month = await db.settings_repo.get_config("last_report_month")
+    if not last_month or last_month == current_month:
         return
-    if last_report_month == current_month_str:
-        return
+    report = await db.generate_monthly_report(last_month)
+    text = (
+        f"📊 <b>Monthly Report ({last_month})</b>\n\n"
+        f"🔹 <b>Total Orders:</b> {report.get('Total Orders', 0)}\n\n"
+        f"📦 <b>Items Sold:</b>\n{report.get('Items Sold', 'အရောင်းမရှိပါ')}"
+    )
+    await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+    await db.settings_repo.set_config("last_report_month", current_month)
+
+async def clean_expired_licenses(context):
+    db = context.bot_data.get('db')
+    if db:
+        count = await db.license_repo.cleanup_expired()
+        if count > 0:
+            logger.info(f"Cleaned up {count} expired licenses.")
+
+async def purge_old_data_job(context):
+    db = context.bot_data.get('db')
+    if db:
+        del_orders, del_reports = await db.purge_3_months_old_data()
+        if del_orders:
+            logger.info(f"3‑month purge: {del_orders} orders removed.")
+        if del_reports:
+            logger.info(f"3‑month purge: {del_reports} reports removed.")
+
+# ──────────────────────────────────────
+# Startup Notifications (safe, no crash)
+# ──────────────────────────────────────
+async def _notify_startup_task(app):
     try:
-        report = await db.generate_monthly_report(last_report_month)
-        report_text = (
-            f"📊 <b>Monthly Report ({last_report_month})</b>\n\n"
-            f"🔹 <b>Total Orders:</b> {report.get('Total Orders', 0)}\n\n"
-            f"📦 <b>Items Sold:</b>\n{report.get('Items Sold', 'အရောင်းမရှိပါ')}\n"
+        bot = app.bot
+        owner_name = "Admin"
+        try:
+            chat = await bot.get_chat(PRIMARY_ADMIN_ID)
+            owner_name = html.escape(chat.first_name or chat.username or str(PRIMARY_ADMIN_ID))
+        except Exception:
+            pass
+
+        bot_info = await bot.get_me()
+        bot_username = f"@{bot_info.username}" if bot_info.username else "N/A"
+        mmt_now = datetime.now(pytz.timezone('Asia/Yangon')).strftime('%Y-%m-%d %H:%M:%S (MMT)')
+
+        owner_msg = (
+            f"✅ <b>Bot Started Successfully</b>\n\n"
+            f"👤 <b>Owner:</b> {owner_name}\n"
+            f"🆔 <b>Owner ID:</b> <a href='tg://user?id={PRIMARY_ADMIN_ID}'>{PRIMARY_ADMIN_ID}</a>\n"
+            f"🤖 <b>Bot:</b> {bot_username}\n"
+            f"🕒 <b>Time:</b> {mmt_now}\n\n"
+            f"Bot is now running and accepting commands."
         )
-        await context.bot.send_message(chat_id=admin_id, text=report_text, parse_mode="HTML")
-        await db.set_config("last_report_month", current_month_str)
+        await bot.send_message(chat_id=PRIMARY_ADMIN_ID, text=owner_msg, parse_mode="HTML")
+
+        if MASTER_ID != PRIMARY_ADMIN_ID:
+            master_msg = (
+                f"🔔 <b>Client Bot Started</b>\n\n"
+                f"👤 <b>Owner:</b> {owner_name}\n"
+                f"🆔 <b>Owner ID:</b> <a href='tg://user?id={PRIMARY_ADMIN_ID}'>{PRIMARY_ADMIN_ID}</a>\n"
+                f"🤖 <b>Bot:</b> {bot_username}\n"
+                f"🕒 <b>Time:</b> {mmt_now}\n\n"
+                f"The bot is now online."
+            )
+            try:
+                await bot.send_message(chat_id=MASTER_ID, text=master_msg, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Failed to send master startup notification: {e}")
+
+        db = app.bot_data.get('db')
+        if db and db.license_repo.client_mode:
+            http_session = app.bot_data.get('http_session')
+            await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
+                                     PRIMARY_ADMIN_ID, http_session)
     except Exception as e:
-        logger.error(f"Error in monthly report job: {e}")
+        logger.error(f"Startup notification task failed: {e}")
 
-
-# ==========================================
-# 🧹 Background Cleanup Jobs
-# ==========================================
-async def clean_expired_licenses(context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data.get('db')
-    if db is None:
+async def _notify_master_api(bot, master_api_url, secret, admin_id, session):
+    if not master_api_url:
         return
+    owner_name = "Unknown"
+    bot_username = "N/A"
     try:
-        result = await db.licenses.delete_many({"expiry_date": {"$lt": datetime.now(UTC_TZ)}})
-        if result.deleted_count > 0:
-            logger.info(f"Cleaned up {result.deleted_count} expired license(s).")
-    except Exception as e:
-        logger.error(f"Error cleaning expired licenses: {e}")
-
-async def purge_old_data_job(context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data.get('db')
-    if db is None:
-        return
+        chat = await bot.get_chat(admin_id)
+        owner_name = chat.first_name or chat.username or str(admin_id)
+    except Exception:
+        pass
     try:
-        deleted_orders, deleted_reports = await db.purge_3_months_old_data()
-        if deleted_orders > 0:
-            logger.info(f"3-month purge: {deleted_orders} orders removed.")
-        if deleted_reports > 0:
-            logger.info(f"3-month purge: {deleted_reports} reports removed.")
+        me = await bot.get_me()
+        bot_username = f"@{me.username}" if me.username else "N/A"
+    except Exception:
+        pass
+    payload = {
+        "admin_id": admin_id,
+        "owner_name": owner_name,
+        "bot_username": bot_username,
+        "time": datetime.now(pytz.timezone('Asia/Yangon')).strftime('%Y-%m-%d %H:%M:%S (MMT)')
+    }
+    url = master_api_url.rstrip('/') + '/api/notify_startup'
+    headers = {"Authorization": f"Bearer {secret}"}
+    try:
+        async with session.post(url, json=payload, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as resp:
+            if resp.status == 200:
+                logger.info("Master API startup notification sent.")
+            else:
+                logger.warning(f"Master API notification returned {resp.status}")
     except Exception as e:
-        logger.error(f"Error in 3-month purge job: {e}")
+        logger.error(f"Master API notification failed: {e}")
 
-
-# ==========================================
-# 🚨 Global Error Handler
-# ==========================================
-_last_error_notifications = {}
-_ERROR_DEBOUNCE_SECONDS = 300
-
-def _get_error_signature(error: Exception) -> str:
-    return type(error).__name__
-
+# ──────────────────────────────────────
+# Global Error Handler
+# ──────────────────────────────────────
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if context.error:
-        logger.error(f"Global error: {type(context.error).__name__}", exc_info=True)
+    error = context.error
+    if error:
+        logger.error(f"Unhandled error: {type(error).__name__}", exc_info=True)
     else:
         logger.error("Global error: unknown error")
 
-    error = context.error
-    if error is not None:
-        signature = _get_error_signature(error)
-        now = _time.time()
-        last_time = _last_error_notifications.get(signature, 0)
-        if now - last_time < _ERROR_DEBOUNCE_SECONDS:
-            return
-        _last_error_notifications[signature] = now
-        if len(_last_error_notifications) > 100:
-            cutoff = now - _ERROR_DEBOUNCE_SECONDS
-            for key in list(_last_error_notifications.keys()):
-                if _last_error_notifications[key] < cutoff:
-                    del _last_error_notifications[key]
-
-    admin_id = context.bot_data.get('admin_id', ADMIN_ID)
-    short_msg = "An unexpected error occurred."
-    if context.error:
-        short_msg = f"⚠️ Error: {type(context.error).__name__}"
-    try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=short_msg,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Failed to send error notification: {e}")
-
-
-# ==========================================
-# 🌐 Quart Async Web Server
-# ==========================================
+# ──────────────────────────────────────
+# Quart Web Server (live DB check, IP fix, rate limit memory cleanup with task cancel)
+# ──────────────────────────────────────
 quart_app = Quart(__name__)
+
+quart_motor_client = None
+quart_licenses_col = None
+quart_loop = None
+quart_shutdown_event = None
+quart_ready_event = threading.Event()
+
+_rate_limit_lock = None
+_rate_limit_dict = {}
+rate_cleanup_task = None
+
+def get_client_ip(request):
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr
+
+async def _check_rate_limit(ip: str) -> bool:
+    async with _rate_limit_lock:
+        now = datetime.now(UTC_TZ)
+        timestamps = _rate_limit_dict.get(ip, [])
+        timestamps = [t for t in timestamps if (now - t).total_seconds() < RATE_LIMIT_WINDOW]
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            _rate_limit_dict[ip] = timestamps
+            return False
+        timestamps.append(now)
+        _rate_limit_dict[ip] = timestamps
+        return True
+
+async def _rate_limit_cleanup_loop():
+    while True:
+        await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
+        async with _rate_limit_lock:
+            now = datetime.now(UTC_TZ)
+            stale_ips = []
+            for ip, timestamps in _rate_limit_dict.items():
+                fresh = [t for t in timestamps if (now - t).total_seconds() < RATE_LIMIT_WINDOW]
+                if fresh:
+                    _rate_limit_dict[ip] = fresh
+                else:
+                    stale_ips.append(ip)
+            for ip in stale_ips:
+                _rate_limit_dict.pop(ip, None)
+            if stale_ips:
+                logger.debug(f"Rate limit cleanup: removed {len(stale_ips)} stale IPs.")
+
+async def _init_quart_db():
+    global quart_motor_client, quart_licenses_col
+    client = motor.motor_asyncio.AsyncIOMotorClient(
+        MONGO_URI,
+        connect=False,
+        serverSelectionTimeoutMS=5000,
+        maxPoolSize=5,
+        minPoolSize=0
+    )
+    try:
+        await client.admin.command('ping')
+    except Exception as e:
+        logger.critical(f"Quart Motor ping failed: {e}")
+        client.close()
+        return False
+
+    quart_motor_client = client
+    quart_licenses_col = client[DB_NAME]["Licenses"]
+    logger.info("Quart lightweight DB connected.")
+    quart_ready_event.set()
+    return True
+
+async def _close_quart_db():
+    global quart_motor_client
+    if quart_motor_client:
+        quart_motor_client.close()
+        logger.info("Quart Motor client closed.")
+
+bot_running = False
 
 @quart_app.route('/')
 async def health_check():
-    return jsonify({"status": "Bot is running"}), 200
-
-@quart_app.route('/health')
-async def health():
-    return jsonify({"status": "healthy"}), 200
+    if not bot_running:
+        return jsonify({"status": "down", "reason": "bot not started"}), 503
+    if quart_motor_client is None or quart_licenses_col is None:
+        return jsonify({"status": "down", "reason": "DB unavailable"}), 503
+    try:
+        await quart_motor_client.admin.command('ping')
+    except Exception:
+        return jsonify({"status": "down", "reason": "DB ping failed"}), 503
+    return jsonify({"status": "ok", "bot": True, "db": True}), 200
 
 @quart_app.route('/api/license/check/<int:user_id>', methods=['GET'])
 async def api_license_check(user_id: int):
-    auth_header = request.headers.get('Authorization', '')
-    expected_secret = os.getenv("API_SECRET_TOKEN", "")
-
-    if not expected_secret:
-        logger.error("API_SECRET_TOKEN is not configured!")
-        return jsonify({"error": "Server configuration error"}), 500
-
-    if not auth_header.startswith("Bearer "):
-        logger.warning(f"Unauthorized API access attempt for user {user_id}: missing Bearer token")
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != API_SECRET_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
 
-    token = auth_header.split(" ", 1)[1]
-    if token != expected_secret:
-        logger.warning(f"Invalid API token for user {user_id}")
-        return jsonify({"error": "Unauthorized"}), 401
+    ip = get_client_ip(request)
+    if not await _check_rate_limit(ip):
+        return jsonify({"error": "Too many requests"}), 429
 
-    db = quart_app.config.get('db')
-    if db is None:
+    if quart_licenses_col is None:
         return jsonify({"error": "Database unavailable"}), 503
-    try:
-        valid, expiry = await db.check_license_local(user_id)
-    except Exception as e:
-        logger.error(f"Error checking license for {user_id}: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-    response_data = {
-        "valid": valid,
-        "expiry": expiry.isoformat() if expiry else None
-    }
-    return jsonify(response_data), 200
-
-# ✅ Corrected endpoint for client startup notification (Clickable Name + User ID)
-@quart_app.route('/api/notify_startup', methods=['POST'])
-async def api_notify_startup():
-    auth_header = request.headers.get('Authorization', '')
-    expected_secret = os.getenv("API_SECRET_TOKEN", "")
-
-    if not expected_secret:
-        return jsonify({"error": "Server configuration error"}), 500
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized"}), 401
-    token = auth_header.split(" ", 1)[1]
-    if token != expected_secret:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    bot = quart_app.config.get('bot')
-    if bot is None:
-        return jsonify({"error": "Bot not available"}), 503
-
-    admin_id = quart_app.config.get('ADMIN_ID')
-    if not admin_id:
-        return jsonify({"error": "Admin ID not configured"}), 500
-
-    data = await request.get_json()
-    if not data:
-        return jsonify({"error": "Missing JSON body"}), 400
-
-    client_admin_id = data.get('admin_id')
-    owner_name = data.get('owner_name', 'Unknown')
-    bot_username = data.get('bot_username', 'N/A')
-    time_str = data.get('time', '')
-
-    # Both owner name and user ID are clickable links to Telegram profile
-    safe_owner = html.escape(owner_name)
-    owner_link = f'<a href="tg://user?id={client_admin_id}">{safe_owner}</a>'
-    owner_id_link = f'<a href="tg://user?id={client_admin_id}">{client_admin_id}</a>'
-
-    msg = (
-        f"🔔 <b>Client Bot Online</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Owner:</b> {owner_link}\n"
-        f"🆔 <b>User ID:</b> {owner_id_link}\n"
-        f"🤖 <b>Bot:</b> {bot_username}\n"
-        f"📅 <b>Time:</b> {time_str}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
 
     try:
-        await bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML")
-        return jsonify({"status": "notified"}), 200
+        doc = await quart_licenses_col.find_one({"user_id": user_id})
     except Exception as e:
-        logger.error(f"Failed to send startup notification to master: {e}")
-        return jsonify({"error": "Notification failed"}), 500
+        logger.error(f"Quart license lookup error: {e}")
+        return jsonify({"error": "Database error"}), 500
 
-async def run_quart():
-    port = int(os.environ.get("PORT", 8080))
-    await quart_app.run_task(host='0.0.0.0', port=port)
+    if not doc:
+        return jsonify({"valid": False, "expiry": None}), 200
 
+    expiry = doc.get("expiry_date")
+    now_utc = datetime.now(UTC_TZ)
+    if expiry and expiry > now_utc:
+        return jsonify({"valid": True, "expiry": expiry.isoformat()}), 200
+    else:
+        return jsonify({"valid": False, "expiry": expiry.isoformat() if expiry else None}), 200
 
-# ==========================================
-# 🆕 Master Signal Handler
-# ==========================================
-async def master_signal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if master.MASTER_ID is None or str(user_id) != str(master.MASTER_ID):
-        return
+def start_quart():
+    global quart_loop, quart_shutdown_event, _rate_limit_lock, _rate_limit_dict, rate_cleanup_task
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    quart_loop = loop
+
+    _rate_limit_lock = asyncio.Lock()
+    _rate_limit_dict = {}
+
+    quart_shutdown_event = asyncio.Event()
+
+    async def async_init_and_serve():
+        ok = await _init_quart_db()
+        if not ok:
+            logger.error("Quart DB init failed – Quart thread will exit.")
+            return
+
+        global rate_cleanup_task
+        rate_cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop())
+
+        config = Config()
+        config.bind = [f"0.0.0.0:{PORT}"]
+
+        async def _shutdown_trigger():
+            await quart_shutdown_event.wait()
+            logger.info("Quart shutdown signal received.")
+
+        try:
+            await serve(quart_app, config, shutdown_trigger=_shutdown_trigger)
+        finally:
+            if rate_cleanup_task:
+                rate_cleanup_task.cancel()
+                try:
+                    await rate_cleanup_task
+                except asyncio.CancelledError:
+                    pass
+
+    try:
+        loop.run_until_complete(async_init_and_serve())
+    except Exception as e:
+        logger.critical(f"Quart server crashed: {e}", exc_info=True)
+    finally:
+        loop.run_until_complete(_close_quart_db())
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logger.info("Quart thread shut down gracefully.")
+
+# ──────────────────────────────────────
+# Master‑Only Handlers
+# ──────────────────────────────────────
+@master_only
+async def master_paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await paid_command(update, context)
+
+@master_only
+async def master_license_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
-    if db is None:
+    if not db:
         await update.message.reply_text("⏳ Database not ready.")
         return
     args = context.args
@@ -452,77 +575,53 @@ async def master_signal_handler(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             target_id = int(args[1])
             months = int(args[2])
-            await db.add_or_update_license(target_id, months)
-            await update.message.reply_text(f"✅ License updated: User {target_id} +{months} months.")
+            await db.license_repo.add_or_update(target_id, months)
+            await update.message.reply_text(
+                f"✅ License updated: User <a href='tg://user?id={target_id}'>{target_id}</a> +{months} months.",
+                parse_mode="HTML"
+            )
         except ValueError:
-            await update.message.reply_text("❌ Invalid user ID or months. Must be numbers.")
+            await update.message.reply_text("❌ Invalid user ID or months.")
     else:
         await update.message.reply_text("📋 Usage: /license add <user_id> <months>")
-    try:
-        if update.message.chat.type in ['group', 'supergroup']:
-            await update.message.delete()
-    except Exception as e:
-        logger.debug(f"Could not delete master signal message: {e}")
 
-# ==========================================
-# 📞 Client startup notification helper (sends JSON with full details)
-# ==========================================
-async def notify_master_startup(bot, master_api_url: str, secret_token: str, admin_id: int):
-    """Call master server to notify that this client bot has started, with full details."""
-    if not master_api_url:
-        logger.warning("MASTER_API_URL not set, cannot notify master about startup.")
+# ──────────────────────────────────────
+# Bot Application & Registration
+# ──────────────────────────────────────
+quart_thread = None
+
+async def _monitor_quart_thread():
+    while True:
+        await asyncio.sleep(30)
+        if quart_thread and not quart_thread.is_alive():
+            logger.critical("Quart thread is not alive! Health check will fail.")
+
+async def main_async():
+    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event
+
+    quart_ready_event.clear()
+
+    # PTB v20+ compatible ApplicationBuilder (connect_retries removed)
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+           .read_timeout(TELEGRAM_READ_TIMEOUT)
+           .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+           .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+           .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+           .build()
+    )
+
+    if not await init_database(app):
+        logger.critical("Database initialization failed. Exiting.")
         return
 
-    # Gather client details
-    owner_name = "Unknown"
-    bot_username = "N/A"
-    time_str = datetime.now(pytz.timezone('Asia/Yangon')).strftime('%Y-%m-%d %H:%M:%S (MMT)')
+    quart_app.config['ADMIN_ID'] = PRIMARY_ADMIN_ID
+    quart_app.config['API_SECRET_TOKEN'] = API_SECRET_TOKEN
 
-    try:
-        owner_chat = await bot.get_chat(admin_id)
-        owner_name = owner_chat.first_name or owner_chat.username or str(admin_id)
-    except Exception as e:
-        logger.warning(f"Could not fetch owner info for startup notification: {e}")
+    await setup_jobs(app)
 
-    try:
-        me = await bot.get_me()
-        bot_username = f"@{me.username}" if me.username else bot_username
-    except Exception:
-        pass
-
-    payload = {
-        "admin_id": admin_id,
-        "owner_name": owner_name,
-        "bot_username": bot_username,
-        "time": time_str
-    }
-
-    url = master_api_url.rstrip('/') + '/api/notify_startup'
-    headers = {"Authorization": f"Bearer {secret_token}"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    logger.info("Master notified of client startup successfully.")
-                else:
-                    logger.warning(f"Master notification returned status {resp.status}")
-    except Exception as e:
-        logger.error(f"Failed to notify master about startup: {e}")
-
-
-# ==========================================
-# 🚀 Main Entry Point
-# ==========================================
-async def main_async():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    await post_init(app)
-
-    # Admin & Special Commands
-    app.add_handler(CommandHandler("paid", paid_command))
-    app.add_handler(CommandHandler("license", master_signal_handler))
-
-    ADMIN_COMMANDS = [
+    admin_commands = [
         ("setdia", set_dia_command),
         ("setuc", set_uc_command),
         ("deletedia", delete_dia_command),
@@ -536,27 +635,31 @@ async def main_async():
         ("refresh", refresh_command),
         ("fixdb", fix_database_command),
     ]
-    for cmd, handler_func in ADMIN_COMMANDS:
-        app.add_handler(CommandHandler(cmd, handler_func))
+    for cmd, func in admin_commands:
+        app.add_handler(CommandHandler(cmd, admin_only(func)))
 
-    # ✅ ConversationHandler with 15‑minute conversation timeout
+    app.add_handler(CommandHandler("paid", master_paid_command))
+    app.add_handler(CommandHandler("license", master_license_add_command))
+
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
             CallbackQueryHandler(wrap_with_license(show_items), pattern=r"^(show_dia|show_uc)$"),
             CallbackQueryHandler(wrap_with_license(send_welcome), pattern=r"^back_to_main$"),
-            CommandHandler("start", wrap_with_license(send_welcome))
+            CommandHandler("start", wrap_with_license(send_welcome)),
         ],
         states={
             WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_with_license(step2_id_entry))],
             WAIT_CONFIRMATION: [CallbackQueryHandler(wrap_with_license(step3_validation), pattern="^(confirm_id|back_id)$")],
-            WAIT_PAYMENT: [MessageHandler(filters.PHOTO, wrap_with_license(step4_payment))]
+            WAIT_PAYMENT: [MessageHandler(filters.PHOTO, wrap_with_license(step4_payment))],
         },
         fallbacks=[
             CommandHandler("start", wrap_with_license(send_welcome)),
-            MessageHandler(filters.ALL, timeout_handler)   # ✅ timeout fallback
+            MessageHandler(filters.TEXT | filters.PHOTO, timeout_handler),
         ],
-        conversation_timeout=900  # ✅ 15 minutes (in seconds)
+        conversation_timeout=CONVERSATION_TIMEOUT,
+        name="order_conversation",
+        persistent=False,
     )
     app.add_handler(conv_handler)
 
@@ -567,38 +670,78 @@ async def main_async():
 
     app.add_error_handler(global_error_handler)
 
-    jq = app.job_queue
-    if jq:
-        jq.run_repeating(check_timeouts, interval=60, first=10)
-        jq.run_daily(monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
-        jq.run_daily(clean_expired_licenses, time=time(hour=3, minute=0, tzinfo=pytz.UTC))
-        jq.run_daily(purge_old_data_job, time=time(hour=4, minute=0, tzinfo=pytz.UTC))
+    quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
+    quart_thread.start()
 
-    quart_task = asyncio.create_task(run_quart())
-    logger.info("Quart server starting on port 8080...")
+    asyncio.create_task(_monitor_quart_thread())
+
+    ready = await asyncio.to_thread(quart_ready_event.wait, QUART_READY_TIMEOUT)
+    if not ready:
+        logger.warning("Quart DB did not become ready in time; health check may show down.")
+
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    # Polling with Update.ALL_TYPES (compatible with all PTB v20+ versions)
+    await app.updater.start_polling(
+        drop_pending_updates=False,
+        allowed_updates=Update.ALL_TYPES
+    )
+    logger.info("Bot polling started.")
+    bot_running = True
+
+    asyncio.create_task(_notify_startup_task(app))
+
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Received termination signal. Initiating shutdown...")
+        shutdown_event.set()
 
     try:
-        await asyncio.Event().wait()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+    except NotImplementedError:
+        pass
+
+    try:
+        await shutdown_event.wait()
+    except asyncio.CancelledError:
+        pass
     finally:
-        logger.info("Shutting down gracefully...")
+        logger.info("Shutting down…")
+        bot_running = False
+
         db = app.bot_data.get('db')
         if db:
             await db.close()
-        quart_task.cancel()
+            logger.info("Database connection closed.")
+
+        if quart_loop and quart_shutdown_event:
+            quart_loop.call_soon_threadsafe(quart_shutdown_event.set)
+
+        if quart_thread and quart_thread.is_alive():
+            await asyncio.to_thread(quart_thread.join, 5)
+
+        http_session = app.bot_data.get('http_session')
+        if http_session:
+            try:
+                await asyncio.wait_for(http_session.close(), timeout=HTTP_SESSION_CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("HTTP session close timed out.")
+
+        await app.updater.stop()
         await app.stop()
         await app.shutdown()
         logger.info("Bot shutdown complete.")
-
 
 def main():
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
-
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
 
 if __name__ == '__main__':
     main()
