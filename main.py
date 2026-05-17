@@ -237,7 +237,7 @@ async def init_database(application):
     if not await db.settings_repo.get_config("last_report_month"):
         await db.settings_repo.set_config("last_report_month", current_month)
 
-    await db.license_repo.background_refresh(PRIMARY_ADMIN_ID)
+#    await db.license_repo.background_refresh(PRIMARY_ADMIN_ID)
     application.bot_data['name_check_api'] = NAME_CHECK_API
     if NAME_CHECK_API:
         logger.info("Name Check API configured.")
