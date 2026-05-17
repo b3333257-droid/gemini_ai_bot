@@ -33,7 +33,7 @@ class OrderStatus(str, Enum):
     CANCELLED = "cancelled"
 
 # ──────────────────────────────────────
-# Helpers (မပြောင်းပါ)
+# Helpers (ပြင်ဆင်ချက်များ)
 # ──────────────────────────────────────
 def get_db(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
@@ -68,6 +68,7 @@ async def safe_delete_message(message, context: ContextTypes.DEFAULT_TYPE = None
 def escape_html(text: str) -> str:
     return html.escape(str(text)) if text else text
 
+# ✅ ပြင်ဆင်ချက် 1: handle_errors တွင် error message ပို့စဉ် nested error မဖြစ်အောင်
 def handle_errors(handler_func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -76,7 +77,10 @@ def handle_errors(handler_func):
             logger.exception(f"Unhandled error in {handler_func.__name__}: {e}")
             error_msg = "⚠️ စနစ်တွင် အမှားအယွင်းတစ်ခု ဖြစ်ပွားသွားပါသည်။ ကျေးဇူးပြု၍ ခဏနေမှ ထပ်မံကြိုးစားပါ။"
             if update.effective_chat:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=error_msg)
+                try:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=error_msg)
+                except Exception as send_err:
+                    logger.error(f"Failed to send error message to user: {send_err}")
             return ConversationHandler.END
     return wrapped
 
@@ -125,8 +129,12 @@ def validate_game_id(item_type: str, text: str) -> tuple:
             return (match.group(1), "")
         return None
 
+# ✅ ပြင်ဆင်ချက် 3: safe_user_mention last_name only case အတွက် ပြုပြင်ထားသည်
 def safe_user_mention(user_id: int, first_name: str = None, last_name: str = None, fallback: str = "User") -> str:
-    name = (f"{first_name} {last_name}".strip() if first_name else fallback)
+    if first_name or last_name:
+        name = f"{first_name or ''} {last_name or ''}".strip()
+    else:
+        name = fallback
     return f'<a href="tg://user?id={user_id}">{escape_html(name)}</a>'
 
 def build_caption_from_order(order: dict, status_text: str, user_first_name: str = None, user_last_name: str = None) -> str:
@@ -235,7 +243,7 @@ async def get_cached_nickname(db, game_id: str, zone_id: str):
     doc = await col.find_one({"game_id": game_id, "zone_id": zone_id})
     if doc:
         ts = doc.get("timestamp")
-        if ts and (datetime.utcnow() - ts) < timedelta(hours=NICKNAME_CACHE_HOURS):
+        if ts and (datetime.now(UTC_TZ) - ts) < timedelta(hours=NICKNAME_CACHE_HOURS):
             return doc.get("nickname"), doc.get("region", "Unknown"), ts
     return None
 
@@ -244,7 +252,7 @@ async def set_cached_nickname(db, game_id: str, zone_id: str, nickname: str, reg
     try:
         await col.update_one(
             {"game_id": game_id, "zone_id": zone_id},
-            {"$set": {"nickname": nickname, "region": region, "timestamp": datetime.utcnow()}},
+            {"$set": {"nickname": nickname, "region": region, "timestamp": datetime.now(UTC_TZ)}},
             upsert=True
         )
         return True
@@ -252,6 +260,7 @@ async def set_cached_nickname(db, game_id: str, zone_id: str, nickname: str, reg
         logger.error(f"Failed to cache nickname: {e}")
         return False
 
+# ✅ ပြင်ဆင်ချက် 2: fetch_game_nickname တွင် JSON decode error ဖမ်းထားသည်
 async def fetch_game_nickname(context: ContextTypes.DEFAULT_TYPE, api_url: str, game_id: str, zone_id: str = "") -> tuple:
     session = context.bot_data.get('http_session')
     own_session = False
@@ -268,7 +277,11 @@ async def fetch_game_nickname(context: ContextTypes.DEFAULT_TYPE, api_url: str, 
         timeout = aiohttp.ClientTimeout(total=5)
         async with session.get(url, timeout=timeout) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except (aiohttp.ContentTypeError, ValueError) as json_err:
+                    logger.warning(f"Name check API returned invalid JSON for {game_id}: {json_err}")
+                    return "N/A", "Unknown"
                 return data.get("name", "Unknown"), data.get("country", "Unknown")
             else:
                 logger.warning(f"Name check API returned {resp.status}")
@@ -627,7 +640,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("admin_approve_"):
         result = await db.orders.update_one(
             {"order_id": order_id, "status": OrderStatus.VERIFYING},
-            {"$set": {"status": OrderStatus.PROCESSING, "timestamps.updated_at": datetime.utcnow()}}
+            {"$set": {"status": OrderStatus.PROCESSING, "timestamps.updated_at": datetime.now(UTC_TZ)}}
         )
         if result.modified_count == 0:
             await query.answer("⚠️ အော်ဒါကို လက်ခံပြီးသား သို့မဟုတ် အခြေအနေပြောင်းသွားပါပြီ။", show_alert=True)
@@ -947,7 +960,7 @@ async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 def get_remaining_time_str(expiry_date) -> str:
     if not expiry_date:
         return "N/A"
-    diff = expiry_date - datetime.utcnow()
+    diff = expiry_date - datetime.now(UTC_TZ)
     if diff.days < 0:
         return "Expired"
     months = diff.days // 30
