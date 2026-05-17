@@ -659,6 +659,12 @@ async def main_async():
     global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, quart_fatal_event
     global _startup_notification_sent, _startup_lock, app
 
+    # 🔴 Duplicate instance guard (Render safe)
+    if os.environ.get("BOT_RUNNING") == "1":
+        logger.critical("Another bot instance detected (BOT_RUNNING=1). Exiting.")
+        return
+    os.environ["BOT_RUNNING"] = "1"
+
     _startup_notification_sent = False
     quart_ready_event.clear()
     quart_fatal_event.clear()
@@ -750,6 +756,9 @@ async def main_async():
             return
 
         await app.initialize()
+        # ✅ Critical fix: clear any leftover webhook to prevent Conflict 409
+        await app.bot.delete_webhook(drop_pending_updates=True)
+
         quart_app.config['BOT_INSTANCE'] = app.bot
         await app.start()
 
@@ -757,9 +766,15 @@ async def main_async():
             logger.critical("Updater unavailable. Exiting.")
             return
 
+        # 🔴 Updater already running check (tightened)
+        if app.updater.running:
+            logger.critical("Updater already running. Another process may be alive. Exiting.")
+            return
+
         try:
+            # 🔴 CRITICAL: drop_pending_updates=True to avoid conflict
             await app.updater.start_polling(
-                drop_pending_updates=False,
+                drop_pending_updates=True,
                 allowed_updates=["message", "callback_query"]
             )
         except Conflict:
@@ -849,6 +864,10 @@ async def main_async():
                     logger.info("HTTP session closed.")
                 except Exception as e:
                     logger.warning(f"HTTP session close failed: {e}")
+
+        # Clean up duplicate guard flag
+        if "BOT_RUNNING" in os.environ:
+            del os.environ["BOT_RUNNING"]
 
         logger.info("Bot shutdown complete.")
 
