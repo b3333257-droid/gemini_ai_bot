@@ -1,4 +1,4 @@
-# handlers.py
+# handlers.py (ပြင်ဆင်မှုများပါဝင်သည်)
 import re
 import asyncio
 import uuid
@@ -33,7 +33,7 @@ class OrderStatus(str, Enum):
     CANCELLED = "cancelled"
 
 # ──────────────────────────────────────
-# Helpers
+# Helpers (မပြောင်းပါ)
 # ──────────────────────────────────────
 def get_db(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
@@ -253,7 +253,6 @@ async def set_cached_nickname(db, game_id: str, zone_id: str, nickname: str, reg
         return False
 
 async def fetch_game_nickname(context: ContextTypes.DEFAULT_TYPE, api_url: str, game_id: str, zone_id: str = "") -> tuple:
-    """🔧 ပြုပြင်ချက် - bot_data မှ shared http_session ကိုသုံးပါ"""
     session = context.bot_data.get('http_session')
     own_session = False
     if not session:
@@ -394,7 +393,6 @@ async def step1_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['item_type'] = item_type
     context.user_data['quantity'] = amount_str
 
-    # 🔧 ပြုပြင်ချက် - create_order result စစ်ဆေးခြင်း
     result = await db.order_repo.create_order(order_id, query.from_user.id,
                                               query.from_user.first_name,
                                               amount_str, 0, item_type)
@@ -447,7 +445,6 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 nickname, region, ts = cached
             else:
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-                # 🔧 ပြုပြင်ချက် - context ကို fetch_game_nickname သို့ pass လုပ်ခြင်း
                 nickname, region = await fetch_game_nickname(context, name_check_api, game_id, zone_id)
                 if nickname != "N/A":
                     await set_cached_nickname(db, game_id, zone_id, nickname, region)
@@ -549,7 +546,6 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏰ အော်ဒါသက်တမ်းကုန်သွားပါပြီ။ /start မှ ပြန်စတင်ပါ။")
         return ConversationHandler.END
 
-    # Ensure order is still in waiting_payment status
     if order.get("status") != OrderStatus.WAITING_PAYMENT:
         await update.message.reply_text("⚠️ ဤအော်ဒါကို လက်ခံပြီးသား သို့မဟုတ် အခြေအနေပြောင်းသွားပါပြီ။")
         return ConversationHandler.END
@@ -574,7 +570,6 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.order_repo.set_order_admin_msg_id(order_id, sent.message_id)
     except Exception as e:
         logger.error(f"Failed to forward to admin: {e}")
-        # 🔧 ပြုပြင်ချက် - Admin ဆီ မပို့နိုင်ရင် order status ကို waiting_payment အတိုင်းပြန်ထားပါ
         await db.order_repo.update_order_status(order_id, OrderStatus.WAITING_PAYMENT)
         await update.message.reply_text("⚠️ Admin ထံ အချက်အလက်ပို့ရာတွင် ချို့ယွင်းသွားပါသည်။ ကျေးဇူးပြု၍ ငွေလွှဲပုံကို ထပ်မံပို့ပေးပါ။")
         return WAIT_PAYMENT
@@ -630,7 +625,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     item = order.get("order_info", {}).get("item_type", "dia")
 
     if data.startswith("admin_approve_"):
-        # 🔧 ပြုပြင်ချက် - Atomic update ကိုသုံးပြီး double approval ကာကွယ်ခြင်း
         result = await db.orders.update_one(
             {"order_id": order_id, "status": OrderStatus.VERIFYING},
             {"$set": {"status": OrderStatus.PROCESSING, "timestamps.updated_at": datetime.utcnow()}}
@@ -650,7 +644,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await edit_admin_message(query, caption, markup)
 
     elif data.startswith("admin_complete_"):
-        # 🔧 ပြုပြင်ချက် - Atomic update သုံးပါ
         result = await db.orders.update_one(
             {"order_id": order_id, "status": OrderStatus.PROCESSING},
             {"$set": {
@@ -672,7 +665,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await db.orders.update_one({"order_id": order_id}, {"$unset": {"admin_msg_id": ""}})
 
     elif data.startswith("admin_reject_"):
-        # 🔧 ပြုပြင်ချက် - Atomic update သုံးပါ
         result = await db.orders.update_one(
             {"order_id": order_id, "status": OrderStatus.VERIFYING},
             {"$set": {
@@ -698,7 +690,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         await db.orders.update_one({"order_id": order_id}, {"$unset": {"admin_msg_id": ""}})
 
     elif data.startswith("admin_manual_"):
-        # 🔧 ပြုပြင်ချက် - Atomic update သုံးပါ
         result = await db.orders.update_one(
             {"order_id": order_id},
             {"$set": {
@@ -710,7 +701,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("⚠️ အော်ဒါကို ပြင်ဆင်ပြီးဖြစ်နိုင်ပါသည်။", show_alert=True)
             return
 
-        # Status မတူရင် count တိုးမည့် logic ကို ဆက်သုံးနိုင်သည်
         if order.get("status") != OrderStatus.PROCESSING:
             await db.price_repo.increment_monthly_count(qty, item)
 
@@ -804,7 +794,6 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ပို့ချင်သော Message ကို Reply လုပ်ပြီး /post ကိုသုံးပါ။")
         return
 
-    # 🔧 ပြုပြင်ချက် - Streaming pattern ကိုသုံးပြီး memory ချွေတာခြင်း
     pipeline = [{"$group": {"_id": "$user_id"}}]
     cursor = db.orders.aggregate(pipeline)
 
@@ -836,7 +825,6 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             batch = []
             await asyncio.sleep(1)
 
-    # နောက်ဆုံးကျန်တဲ့ batch
     if batch:
         for uid in batch:
             try:
@@ -1054,8 +1042,12 @@ async def _handle_license_add(query, db, target, months):
     await _handle_license_view(query, db, target)
 
 async def _handle_license_revoke(query, db, target):
-    await db.licenses.delete_one({"user_id": target})
-    confirm_msg = f"❌ User <code>{target}</code> ၏ လိုင်စင်ကို ပိတ်လိုက်ပါပြီ။ (ရက်ကျန်မရှိတော့ပါ)"
+    # 🔧 ပြုပြင်ချက် - LicenseRepository ကိုသာ သုံးပါ
+    success = await db.license_repo.revoke_license(target)
+    if success:
+        confirm_msg = f"❌ User <code>{target}</code> ၏ လိုင်စင်ကို ပိတ်လိုက်ပါပြီ။ (ရက်ကျန်မရှိတော့ပါ)"
+    else:
+        confirm_msg = "⚠️ လိုင်စင်ပိတ်ရာတွင် အမှားအယွင်းရှိပါသည်။"
     await query.message.reply_text(confirm_msg, parse_mode=ADMIN_PARSE_MODE)
     await _handle_license_main_list(query, db)
 
@@ -1071,6 +1063,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     data = query.data
 
+    # 🔧 ပြုပြင်ချက် - တိတိကျကျ callback parse လုပ်ခြင်း
     if data.startswith("license_view_"):
         target = int(data.split("_")[-1])
         await _handle_license_view(query, db, target)
@@ -1078,26 +1071,32 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
     elif data == "license_main_list":
         await _handle_license_main_list(query, db)
 
-    elif data.startswith("license_add_") or data.startswith("license_revoke_"):
-        parts = data.split("_")
-        if len(parts) < 4:
+    elif data.startswith("license_add_"):
+        # format: license_add_{months}_{user_id}
+        try:
+            _, _, months_str, target_str = data.split("_")
+            months = int(months_str)
+            target = int(target_str)
+        except (ValueError, IndexError):
             await query.answer("⚠️ ဒေတာ မှားယွင်းနေပါသည်။", show_alert=True)
             return
+        await _handle_license_add(query, db, target, months)
 
-        action = parts[1]
-        if action == "add":
-            months = int(parts[2])
-            target = int(parts[3])
-            await _handle_license_add(query, db, target, months)
-        elif action == "revoke":
-            target = int(parts[2])
-            await _handle_license_revoke(query, db, target)
+    elif data.startswith("license_revoke_"):
+        # format: license_revoke_{user_id}
+        try:
+            _, _, target_str = data.split("_")
+            target = int(target_str)
+        except (ValueError, IndexError):
+            await query.answer("⚠️ ဒေတာ မှားယွင်းနေပါသည်။", show_alert=True)
+            return
+        await _handle_license_revoke(query, db, target)
 
     else:
         await query.answer("⚠️ မသိသော command", show_alert=True)
 
 # ──────────────────────────────────────
-# Refresh Command
+# Refresh Command (ပြင်ဆင်ချက် - cache invalidate အရင်လုပ်)
 # ──────────────────────────────────────
 _LAST_CLEANUP_DATE = None
 
@@ -1136,7 +1135,10 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_typing(update, context)
     admin_id = db.primary_admin_id
-    valid = await db.license_repo.force_refresh(admin_id)
+
+    # 🔧 ပြုပြင်ချက် - cache ကို အရင် invalidate လုပ်ပြီးမှ စစ်ဆေးပါ
+    await db.license_repo.cache.invalidate(admin_id)
+    valid = await db.license_repo.is_license_valid(admin_id)
     if valid:
         _, expiry = await db.license_repo._check_local(admin_id)
         time_str = get_remaining_time_str(expiry)
