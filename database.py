@@ -10,7 +10,7 @@ import aiohttp
 import motor.motor_asyncio
 import pytz
 from dateutil.relativedelta import relativedelta
-from pymongo import UpdateOne, ASCENDING
+from pymongo import UpdateOne  # ASCENDING ကို မသုံးတော့၍ ဖယ်ထုတ်ထားပါသည်
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,6 @@ class LicenseCache:
                 if self._stop_event.is_set():
                     break
 
-                # 🔧 ပြုပြင်ချက် - lock ကိုင်ချိန်ကို လျှော့ချပြီး keys များကို lock အတွင်းတွင်သာ စုဆောင်းပါ
                 expired_keys = []
                 now = datetime.now(UTC_TZ)
                 async with self._lock:
@@ -81,7 +80,6 @@ class LicenseCache:
                         if (now - data.get("cached_at", now)) >= timedelta(seconds=data.get("ttl_seconds", 60)):
                             expired_keys.append(uid)
 
-                # ဖျက်ခြင်းကို lock အပြင်၌ ပြုလုပ်ပါ (တစ်ခုချင်းစီမဖျက်ဘဲ lock နဲ့မဆိုင်တော့ပါ)
                 for uid in expired_keys:
                     async with self._lock:
                         self._cache.pop(uid, None)
@@ -243,9 +241,6 @@ class PriceRepository:
         logger.info(f"Reset monthly counts for {len(items)} items")
 
     async def migrate_legacy_diamond_types(self) -> int:
-        """
-        🔧 ပြုပြင်ချက် - bulk_write ကိုသုံးပြီး စွမ်းဆောင်ရည်မြှင့်ပါ။
-        """
         updated = skipped = 0
         ops = []
         try:
@@ -258,12 +253,9 @@ class PriceRepository:
                 if diamond_int is not None:
                     set_fields["diamond_int"] = diamond_int
                 ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": set_fields}))
-                # Bulk batch size 500 ဆိုပြီး ချက်ချင်းပို့ (memory သက်သာ)
                 if len(ops) >= 500:
                     res = await self.col.bulk_write(ops, ordered=False)
                     updated += res.modified_count
-                    # DuplicateKeyError အတွက် failed operations ကိုတွက်မယ်
-                    # bulk_write သည် DuplicateKeyError ကို မြှင့်တင်နိုင်သည်၊ ထို့ကြောင့် try/except ထည့်ပါ
                     ops = []
 
             if ops:
@@ -273,7 +265,6 @@ class PriceRepository:
             logger.info(f"Migrated {updated} non‑string diamonds.")
             return updated
         except DuplicateKeyError as e:
-            # အနည်းဆုံး တစ်ခုခု duplicate ဖြစ်လို့ bulk abort လုပ်ရင် (ordered=True မသုံးထားတော့ ဖြစ်နိုင်ချေနည်း)
             logger.error(f"Bulk migration DuplicateKeyError: {e}")
             return -1
         except Exception as e:
@@ -370,7 +361,6 @@ class OrderRepository:
 
     async def update_order_status(self, order_id: str, new_status: str):
         now = datetime.now(UTC_TZ)
-        # 🔧 ပြုပြင်ချက် - ရှင်းလင်းသော update dictionary တည်ဆောက်ခြင်း
         set_fields = {
             "status": new_status,
             "timestamps.updated_at": now
@@ -380,7 +370,6 @@ class OrderRepository:
         if new_status == "waiting_payment":
             set_fields["expire_at"] = now + timedelta(minutes=15)
         elif new_status in ("completed", "failed", "cancelled", "timeout"):
-            # expire_at field ကိုဖျက်ရန် $unset သုံးပါ
             update_doc["$unset"] = {"expire_at": ""}
 
         await self.col.update_one({"order_id": order_id}, update_doc)
@@ -456,7 +445,12 @@ class LicenseRepository:
             raise ValueError("MASTER_API_URL not set")
         url = f"{self.master_url.rstrip('/')}/api/license/check/{user_id}"
         timeout = aiohttp.ClientTimeout(total=10)
-        session = self._session or aiohttp.ClientSession()
+
+        close_after = False
+        session = self._session
+        if not session:
+            session = aiohttp.ClientSession()
+            close_after = True
         try:
             async with session.get(url, timeout=timeout,
                                    headers={"Authorization": f"Bearer {self.secret}"}) as resp:
@@ -466,16 +460,17 @@ class LicenseRepository:
                 data = await resp.json()
                 return data.get("valid", False), _ensure_utc(data.get("expiry"))
         finally:
-            if self._session is None:
+            if close_after:
                 await session.close()
 
+    # ========== ပြင်ဆင်ချက် 1: master fail fallback (cache only, no stale DB) ==========
     async def _fetch_fresh(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
-        # 1. Local check
-        valid_local, expiry_local = await self._check_local(user_id)
-        if valid_local:
-            return True, expiry_local
-
-        # 2. If client mode, try master
+        """
+        Client mode ဖြစ်ပါက master ကို အရင်စစ်ဆေးပါ။
+        Master မှ valid ဆိုလျှင် local DB ကို update လုပ်ပြီး valid ပြန်ပါ။
+        Master မှ invalid ဆိုလျှင် local document ကို ဖျက်ပြီး invalid ပြန်ပါ။
+        Master ချိတ်ဆက်မှု ပျက်ကွက်ပါက **cache** မှသာ ပြန်ပေးပြီး local DB ဟောင်းနွမ်းမှုကို ရှောင်ရှားပါ။
+        """
         if self.client_mode:
             try:
                 valid_master, expiry_master = await self._fetch_from_master(user_id)
@@ -485,11 +480,21 @@ class LicenseRepository:
                         {"$set": {"expiry_date": expiry_master}},
                         upsert=True
                     )
-                return valid_master, expiry_master
+                    return True, expiry_master
+                else:
+                    # master says invalid → remove local doc to avoid stale data
+                    await self.col.delete_one({"user_id": user_id})
+                    return False, None
             except Exception as e:
                 logger.warning(f"Master fetch failed for {user_id}: {e}")
+                # Fallback to cache (last known good state), never the local DB directly
+                cached = await self.cache.get(user_id)
+                if cached:
+                    return cached.get("valid", False), cached.get("expiry")
+                return False, None
 
-        return False, None
+        # Standalone mode (no master): use local DB
+        return await self._check_local(user_id)
 
     async def is_license_valid(self, user_id: int) -> bool:
         user_id = _safe_int_or_log(user_id, "is_license_valid")
@@ -515,19 +520,18 @@ class LicenseRepository:
     async def _fetch_and_cache(self, user_id: int) -> bool:
         try:
             valid, expiry = await self._fetch_fresh(user_id)
+            ttl = 86400 if valid else 300
+            await self.cache.set(user_id, valid, expiry, ttl)
+            return valid
         except Exception as e:
             logger.error(f"Fresh license fetch failed for {user_id}: {e}")
             cached = await self.cache.get(user_id)
             if cached and cached.get("expiry") and cached["expiry"] > datetime.now(UTC_TZ):
                 return True
             return False
-
-        ttl = 86400 if valid else 300
-        await self.cache.set(user_id, valid, expiry, ttl)
-
-        async with self._pending_lock:
-            self._pending.pop(user_id, None)
-        return valid
+        finally:
+            async with self._pending_lock:
+                self._pending.pop(user_id, None)
 
     async def force_refresh(self, user_id: int) -> bool:
         user_id = _safe_int_or_log(user_id, "force_refresh")
@@ -587,6 +591,21 @@ class LicenseRepository:
             logger.info(f"Cleaned up {deleted} expired licenses")
         return deleted
 
+    # ========== revoke – delete document ==========
+    async def revoke_license(self, user_id: int) -> bool:
+        """လိုင်စင်ကို အပြီးအပိုင် ဖျက်ပစ်ပါ (document အားဖျက်ခြင်း)"""
+        user_id = _safe_int_or_log(user_id, "revoke_license")
+        if user_id is None:
+            return False
+        try:
+            await self.col.delete_one({"user_id": user_id})
+            await self.cache.invalidate(user_id)
+            logger.info(f"License revoked for {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error revoking license for {user_id}: {e}")
+            return False
+
 
 class BannedUserRepository:
     """Manages banned users DB + in‑memory set."""
@@ -635,7 +654,6 @@ class BannedUserRepository:
             return False
 
     async def is_banned(self, user_id: int) -> bool:
-        # Note: multi‑instance တွင် memory set အစား direct DB query သုံးပါ
         try:
             return int(user_id) in self.banned_set
         except (ValueError, TypeError):
@@ -717,6 +735,7 @@ class DatabaseManager:
                  http_session: Optional[aiohttp.ClientSession] = None,
                  banned_set: Optional[Set[int]] = None,
                  primary_admin_id: Optional[int] = None):
+        # Mongo connection pool settings optimized for free‑tier / small VPS
         self.client = motor.motor_asyncio.AsyncIOMotorClient(
             uri,
             connect=False,
@@ -726,7 +745,7 @@ class DatabaseManager:
             retryWrites=True,
             retryReads=True,
             maxPoolSize=20,
-            minPoolSize=5,
+            minPoolSize=1,   # ← ပြင်ဆင်ချက် 3: free tier အတွက် 1 သို့လျှော့ချထားပါသည်
             waitQueueTimeoutMS=5000,
             maxIdleTimeMS=60000,
         )
@@ -800,13 +819,8 @@ class DatabaseManager:
         logger.info("DatabaseManager closed.")
 
     async def generate_monthly_report(self, year_month: str) -> dict:
-        """
-        🔧 ပြုပြင်ချက် - Transaction သုံးပြီး monthly counts ကို atomic စွာ reset လုပ်ပါ။
-        MongoDB replica set လိုအပ်ပါသည်။ မရှိပါက fallback အနေဖြင့် မူလနည်းအတိုင်း သုံးပါ။
-        """
         report_data = await self.order_repo.generate_monthly_report_data(year_month)
 
-        # Transaction ဖြင့် အရောင်းစာရင်းများကို atomically reset လုပ်ပါ
         async with await self.client.start_session() as session:
             try:
                 async with session.start_transaction():
@@ -838,9 +852,7 @@ class DatabaseManager:
                     return report
 
             except OperationFailure as e:
-                # Transaction မပံ့ပိုးသော standalone MongoDB အတွက် fallback
                 logger.warning(f"Transaction failed (maybe standalone MongoDB): {e}. Falling back to non-atomic reset.")
-                # Fallback: read and reset without transaction (same as before)
                 prices = await self.price_repo.get_all_with_monthly_counts()
                 items_sold = []
                 items_to_reset = []
@@ -856,7 +868,6 @@ class DatabaseManager:
                 return report
             except Exception as e:
                 logger.error(f"Unexpected error in monthly report: {e}")
-                # နောက်ဆုံး fallback
                 prices = await self.price_repo.get_all_with_monthly_counts()
                 items_sold = []
                 items_to_reset = []
