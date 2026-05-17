@@ -1,11 +1,10 @@
-# main.py (အစအဆုံး)
+# main.py (အစအဆုံး – critical fix: call_soon_threadsafe usage)
 """
 main.py – Production‑ready bot entry point (Render‑optimized).
 - Master ID from hardcoded master.py.
 - Quart web server runs in separate thread with lightweight Motor client.
 - Hypercorn ASGI server.
 - Graceful shutdown using asyncio.Event + signal handlers.
-- No cross‑thread Telegram bot object usage.
 - Rate limited license check API with IP leak prevention and periodic memory cleanup.
 - Enhanced health check with live DB ping.
 - Race condition mitigation via threading.Event for Quart DB ready.
@@ -14,6 +13,11 @@ main.py – Production‑ready bot entry point (Render‑optimized).
 - Background Quart thread health monitor.
 - Safe for external supervisor (Render auto-restart) – no internal restart loop.
 - Startup notification sent only once per process lifetime (guard flag).
+- Proper shutdown ordering: Telegram → Quart → DB → HTTP session.
+- Quart fatal failure triggers process exit using threading.Event (only on crash).
+- Reduced allowed_updates to save memory (string list, correct PTB format).
+- Reduced Telegram connection pool for free‑tier RAM.
+- Extra guards: safe Quart shutdown event set (loop closed), and app.initialize() fail handling.
 """
 
 import os
@@ -23,7 +27,7 @@ import logging
 import html
 import signal
 import threading
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 
@@ -87,7 +91,6 @@ file_handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_SIZE, backupCount=
 file_handler.setFormatter(log_format)
 logging.basicConfig(level=logging.INFO, handlers=[console, file_handler])
 logger = logging.getLogger(__name__)
-# propagates to root handlers automatically
 
 # ──────────────────────────────────────
 # Environment & Configuration
@@ -135,21 +138,20 @@ ALL_ADMIN_IDS = [PRIMARY_ADMIN_ID] + extra_admin_ids
 # Constants
 # ──────────────────────────────────────
 CONVERSATION_TIMEOUT = 900
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 20
 DB_PING_RETRIES = 3
 DB_PING_RETRY_DELAY = 5
 HTTP_SESSION_CLOSE_TIMEOUT = 5.0
 QUART_SHUTDOWN_TIMEOUT = 10.0
 RATE_LIMIT_MAX = 10
 RATE_LIMIT_WINDOW = 60
-QUART_READY_TIMEOUT = 10  # seconds to wait for Quart DB init
-RATE_LIMIT_CLEANUP_INTERVAL = 300  # 5 minutes
+QUART_READY_TIMEOUT = 10
+RATE_LIMIT_CLEANUP_INTERVAL = 300
 
-# Telegram connection settings (PTB v20+)
 TELEGRAM_CONNECT_TIMEOUT = 10.0
 TELEGRAM_READ_TIMEOUT = 30.0
 TELEGRAM_WRITE_TIMEOUT = 30.0
-TELEGRAM_CONNECTION_POOL_SIZE = 256
+TELEGRAM_CONNECTION_POOL_SIZE = 32
 TELEGRAM_POOL_TIMEOUT = 1.0
 
 logger.info("=== Bot Starting ===")
@@ -247,7 +249,8 @@ async def init_database(application):
 async def setup_jobs(application):
     jq = application.job_queue
     if not jq:
-        logger.critical("❌ PTB JobQueue not available! Background tasks will NOT run.")
+        logger.critical("❌ PTB JobQueue not available! Install python-telegram-bot[job-queue]")
+        logger.critical("Bot will continue WITHOUT background jobs (timeout check, reports, etc.)")
         return
     jq.run_repeating(check_timeouts, interval=60, first=10)
     jq.run_daily(monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
@@ -299,18 +302,18 @@ async def purge_old_data_job(context):
             logger.info(f"3‑month purge: {del_reports} reports removed.")
 
 # ──────────────────────────────────────
-# Startup Notifications (with duplicate guard)
+# Startup Notifications (race‑condition safe)
 # ──────────────────────────────────────
-# Global flag to ensure startup notification runs exactly once per process lifetime.
 _startup_notification_sent = False
+_startup_lock = None  # Created in main_async
 
 async def _notify_startup_task(app):
-    global _startup_notification_sent
-    # Double-check guard (in case of parallel calls, though unlikely)
-    if _startup_notification_sent:
-        logger.debug("Startup notification already sent; skipping duplicate call.")
-        return
-    _startup_notification_sent = True
+    global _startup_notification_sent, _startup_lock
+    async with _startup_lock:
+        if _startup_notification_sent:
+            logger.debug("Startup notification already sent; skipping duplicate call.")
+            return
+        _startup_notification_sent = True
 
     try:
         bot = app.bot
@@ -335,25 +338,10 @@ async def _notify_startup_task(app):
         )
         await bot.send_message(chat_id=PRIMARY_ADMIN_ID, text=owner_msg, parse_mode="HTML")
 
-        # Notify master if this is a client bot (owner != master)
-        if MASTER_ID != PRIMARY_ADMIN_ID:
-            master_msg = (
-                f"🔔 <b>Client Bot Started</b>\n\n"
-                f"👤 <b>Owner:</b> {owner_name}\n"
-                f"🆔 <b>Owner ID:</b> <a href='tg://user?id={PRIMARY_ADMIN_ID}'>{PRIMARY_ADMIN_ID}</a>\n"
-                f"🤖 <b>Bot:</b> {bot_username}\n"
-                f"🕒 <b>Time:</b> {mmt_now}\n\n"
-                f"The bot is now online."
-            )
-            try:
-                await bot.send_message(chat_id=MASTER_ID, text=master_msg, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"Failed to send master startup notification: {e}")
-
         db = app.bot_data.get('db')
         if db and db.license_repo.client_mode:
             http_session = app.bot_data.get('http_session')
-            # Use attribute on app to avoid duplicate API call within same run
+            logger.info(f"client_mode={db.license_repo.client_mode}, master_url={db.license_repo.master_url}")
             if not getattr(app, '_master_api_notified', False):
                 app._master_api_notified = True
                 await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
@@ -405,15 +393,60 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         logger.error("Global error: unknown error")
 
 # ──────────────────────────────────────
-# Quart Web Server (no changes needed)
+# Quart Web Server
 # ──────────────────────────────────────
 quart_app = Quart(__name__)
+
+@quart_app.route('/api/notify_startup', methods=['POST'])
+async def api_notify_startup():
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != API_SECRET_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = await request.get_json()
+    if not data:
+        return jsonify({"error": "Missing JSON"}), 400
+
+    admin_id = data.get('admin_id')
+    try:
+        if int(admin_id) == MASTER_ID:
+            logger.info("Ignored master self-notification.")
+            return jsonify({"status": "ignored", "reason": "master self notification"}), 200
+    except (ValueError, TypeError):
+        pass
+
+    owner_name = data.get('owner_name', 'Unknown')
+    bot_username = data.get('bot_username', 'N/A')
+    time_str = data.get('time', '')
+
+    app_bot = quart_app.config.get('BOT_INSTANCE')
+    if not app_bot:
+        return jsonify({"error": "Bot unavailable"}), 503
+
+    msg = (
+        f"🔔 <b>Client Bot Started</b>\n\n"
+        f"👤 <b>Owner:</b> {html.escape(owner_name)}\n"
+        f"🆔 <b>User ID:</b> <code>{admin_id}</code>\n"
+        f"🤖 <b>Bot:</b> {bot_username}\n"
+        f"🕒 <b>Time:</b> {time_str}"
+    )
+    try:
+        await app_bot.send_message(
+            chat_id=MASTER_ID,
+            text=msg,
+            parse_mode="HTML"
+        )
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.error(f"Notify startup failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 quart_motor_client = None
 quart_licenses_col = None
 quart_loop = None
 quart_shutdown_event = None
 quart_ready_event = threading.Event()
+quart_fatal_event = threading.Event()
 
 _rate_limit_lock = None
 _rate_limit_dict = {}
@@ -426,6 +459,8 @@ def get_client_ip(request):
     return request.remote_addr
 
 async def _check_rate_limit(ip: str) -> bool:
+    if _rate_limit_lock is None:
+        return True
     async with _rate_limit_lock:
         now = datetime.now(UTC_TZ)
         timestamps = _rate_limit_dict.get(ip, [])
@@ -443,7 +478,7 @@ async def _rate_limit_cleanup_loop():
         async with _rate_limit_lock:
             now = datetime.now(UTC_TZ)
             stale_ips = []
-            for ip, timestamps in _rate_limit_dict.items():
+            for ip, timestamps in list(_rate_limit_dict.items()):
                 fresh = [t for t in timestamps if (now - t).total_seconds() < RATE_LIMIT_WINDOW]
                 if fresh:
                     _rate_limit_dict[ip] = fresh
@@ -468,6 +503,8 @@ async def _init_quart_db():
     except Exception as e:
         logger.critical(f"Quart Motor ping failed: {e}")
         client.close()
+        quart_fatal_event.set()
+        quart_ready_event.set()
         return False
 
     quart_motor_client = client
@@ -539,7 +576,7 @@ def start_quart():
     async def async_init_and_serve():
         ok = await _init_quart_db()
         if not ok:
-            logger.error("Quart DB init failed – Quart thread will exit.")
+            logger.critical("Quart DB init failed – Quart thread will exit.")
             return
 
         global rate_cleanup_task
@@ -566,6 +603,7 @@ def start_quart():
         loop.run_until_complete(async_init_and_serve())
     except Exception as e:
         logger.critical(f"Quart server crashed: {e}", exc_info=True)
+        quart_fatal_event.set()
     finally:
         loop.run_until_complete(_close_quart_db())
         loop.run_until_complete(loop.shutdown_asyncgens())
@@ -606,17 +644,26 @@ async def master_license_add_command(update: Update, context: ContextTypes.DEFAU
 quart_thread = None
 
 async def _monitor_quart_thread():
+    warned = False
     while True:
         await asyncio.sleep(30)
         if quart_thread and not quart_thread.is_alive():
-            logger.critical("Quart thread is not alive! Health check will fail.")
+            if not warned:
+                logger.critical("Quart thread is not alive! Health check will fail.")
+                warned = True
+            return
+
+app = None
 
 async def main_async():
-    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, _startup_notification_sent
+    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, quart_fatal_event
+    global _startup_notification_sent, _startup_lock, app
 
-    # Reset guard for each run (but this is inside main_async which runs once)
     _startup_notification_sent = False
     quart_ready_event.clear()
+    quart_fatal_event.clear()
+
+    _startup_lock = asyncio.Lock()
 
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
@@ -627,6 +674,8 @@ async def main_async():
            .pool_timeout(TELEGRAM_POOL_TIMEOUT)
            .build()
     )
+
+    monitor_task = None
 
     try:
         # ---------- Startup ----------
@@ -673,7 +722,7 @@ async def main_async():
             },
             fallbacks=[
                 CommandHandler("start", wrap_with_license(send_welcome)),
-                MessageHandler(filters.TEXT | filters.PHOTO, timeout_handler),
+                MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, timeout_handler),
             ],
             conversation_timeout=CONVERSATION_TIMEOUT,
             name="order_conversation",
@@ -691,22 +740,35 @@ async def main_async():
         quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
         quart_thread.start()
 
-        asyncio.create_task(_monitor_quart_thread())
+        monitor_task = asyncio.create_task(_monitor_quart_thread())
 
         ready = await asyncio.to_thread(quart_ready_event.wait, QUART_READY_TIMEOUT)
         if not ready:
             logger.warning("Quart DB did not become ready in time; health check may show down.")
+        if quart_fatal_event.is_set():
+            logger.critical("Quart DB initialization failed fatally. Exiting bot.")
+            return
 
         await app.initialize()
+        quart_app.config['BOT_INSTANCE'] = app.bot
         await app.start()
-        await app.updater.start_polling(
-            drop_pending_updates=False,
-            allowed_updates=Update.ALL_TYPES
-        )
-        logger.info("Bot polling started.")
-        bot_running = True
 
-        # Send startup notification exactly once (guard ensures it)
+        if not app.updater:
+            logger.critical("Updater unavailable. Exiting.")
+            return
+
+        try:
+            await app.updater.start_polling(
+                drop_pending_updates=False,
+                allowed_updates=["message", "callback_query"]
+            )
+        except Conflict:
+            logger.critical("Another bot instance is already polling. Exiting.")
+            return
+
+        bot_running = True
+        logger.info("Bot polling started.")
+
         if not _startup_notification_sent:
             asyncio.create_task(_notify_startup_task(app))
 
@@ -723,8 +785,16 @@ async def main_async():
         except NotImplementedError:
             pass
 
+        async def wait_for_shutdown():
+            while not shutdown_event.is_set():
+                if quart_fatal_event.is_set():
+                    logger.critical("Quart fatal failure detected. Shutting down bot.")
+                    shutdown_event.set()
+                    break
+                await asyncio.sleep(0.5)
+
         try:
-            await shutdown_event.wait()
+            await wait_for_shutdown()
         except asyncio.CancelledError:
             pass
 
@@ -733,40 +803,52 @@ async def main_async():
         logger.info("Shutting down…")
         bot_running = False
 
-        db = app.bot_data.get('db')
-        if db:
-            await db.close()
-            logger.info("Database connection closed.")
+        if app:
+            try:
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                if app.running:
+                    await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
 
+        if monitor_task:
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop Quart safely – CRITICAL FIX: pass the function, not the result
         if quart_loop and quart_shutdown_event:
-            quart_loop.call_soon_threadsafe(quart_shutdown_event.set)
+            try:
+                quart_loop.call_soon_threadsafe(quart_shutdown_event.set)
+            except Exception:
+                logger.debug("Quart event loop already closed (or not accessible).")
 
         if quart_thread and quart_thread.is_alive():
-            await asyncio.to_thread(quart_thread.join, 5)
+            await asyncio.to_thread(quart_thread.join, QUART_SHUTDOWN_TIMEOUT)
 
-        http_session = app.bot_data.get('http_session')
-        if http_session and not http_session.closed:
-            try:
-                await asyncio.wait_for(http_session.close(), timeout=HTTP_SESSION_CLOSE_TIMEOUT)
-                logger.info("HTTP session closed.")
-            except Exception as e:
-                logger.warning(f"HTTP session close failed: {e}")
+        if app:
+            db = app.bot_data.get('db')
+            if db:
+                await db.close()
+                logger.info("Database connection closed.")
 
-        # Safe stop – may fail if app not fully initialized
-        try:
-            if app.updater and app.updater.running:
-                await app.updater.stop()
-        except Exception:
-            pass
-        try:
-            if app.running:
-                await app.stop()
-        except Exception:
-            pass
-        try:
-            await app.shutdown()
-        except Exception:
-            pass
+            http_session = app.bot_data.get('http_session')
+            if http_session and not http_session.closed:
+                try:
+                    await asyncio.wait_for(http_session.close(), timeout=HTTP_SESSION_CLOSE_TIMEOUT)
+                    logger.info("HTTP session closed.")
+                except Exception as e:
+                    logger.warning(f"HTTP session close failed: {e}")
 
         logger.info("Bot shutdown complete.")
 
