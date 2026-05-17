@@ -1,4 +1,4 @@
-# database.py
+# database.py (Render‑free optimized final – Settings index fix)
 import asyncio
 import logging
 import os
@@ -10,32 +10,24 @@ import aiohttp
 import motor.motor_asyncio
 import pytz
 from dateutil.relativedelta import relativedelta
-from pymongo import UpdateOne  # ASCENDING ကို မသုံးတော့၍ ဖယ်ထုတ်ထားပါသည်
+from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
 logger = logging.getLogger(__name__)
 UTC_TZ = pytz.UTC
 
 
-# ==========================================
-# 🛠 Utility Functions
-# ==========================================
 def _to_str(value) -> str:
-    """Convert any value to string safely, return "" for None/non‑stringable."""
     return str(value) if value is not None else ""
 
-
 def _safe_int_or_log(value, name="value") -> Optional[int]:
-    """Convert to int; on failure log a warning and return None."""
     try:
         return int(str(value).strip())
     except (ValueError, TypeError) as e:
         logger.warning(f"Invalid {name} (expected int): {value!r} - {e}")
         return None
 
-
 def _ensure_utc(dt):
-    """Return a timezone‑aware UTC datetime from a string or datetime object."""
     if dt is None:
         return None
     if isinstance(dt, str):
@@ -54,9 +46,6 @@ def _ensure_utc(dt):
     return dt
 
 
-# ==========================================
-# 📦 License Cache
-# ==========================================
 class LicenseCache:
     def __init__(self, cleanup_interval: int = 3600):
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -66,22 +55,23 @@ class LicenseCache:
         self._stop_event = asyncio.Event()
 
     async def _cleanup_loop(self):
-        """Periodically remove expired cache entries without holding the lock for too long."""
         while not self._stop_event.is_set():
             try:
                 await asyncio.sleep(self._cleanup_interval)
                 if self._stop_event.is_set():
                     break
 
-                expired_keys = []
                 now = datetime.now(UTC_TZ)
                 async with self._lock:
-                    for uid, data in list(self._cache.items()):
-                        if (now - data.get("cached_at", now)) >= timedelta(seconds=data.get("ttl_seconds", 60)):
+                    expired_keys = []
+                    for uid, data in self._cache.items():
+                        cached_at = data.get("cached_at")
+                        if cached_at is None:
                             expired_keys.append(uid)
-
-                for uid in expired_keys:
-                    async with self._lock:
+                            continue
+                        if (now - cached_at) >= timedelta(seconds=data.get("ttl_seconds", 60)):
+                            expired_keys.append(uid)
+                    for uid in expired_keys:
                         self._cache.pop(uid, None)
 
                 if expired_keys:
@@ -133,11 +123,7 @@ class LicenseCache:
             self._cache.pop(key, None)
 
 
-# ==========================================
-# Repository Classes
-# ==========================================
 class PriceRepository:
-    """All CRUD for the 'Prices' collection."""
     def __init__(self, col):
         self.col = col
 
@@ -237,11 +223,14 @@ class PriceRepository:
             UpdateOne({"type": t, "diamond": d}, {"$set": {"monthly_count": 0}})
             for t, d in items
         ]
-        await self.col.bulk_write(ops)
-        logger.info(f"Reset monthly counts for {len(items)} items")
+        try:
+            res = await self.col.bulk_write(ops, ordered=False)
+            logger.info(f"Reset monthly counts for {len(items)} items, modified={res.modified_count}")
+        except Exception as e:
+            logger.error(f"Bulk reset monthly counts failed: {e}")
 
     async def migrate_legacy_diamond_types(self) -> int:
-        updated = skipped = 0
+        updated = 0
         ops = []
         try:
             cursor = self.col.find({"diamond": {"$not": {"$type": "string"}}})
@@ -257,11 +246,9 @@ class PriceRepository:
                     res = await self.col.bulk_write(ops, ordered=False)
                     updated += res.modified_count
                     ops = []
-
             if ops:
                 res = await self.col.bulk_write(ops, ordered=False)
                 updated += res.modified_count
-
             logger.info(f"Migrated {updated} non‑string diamonds.")
             return updated
         except DuplicateKeyError as e:
@@ -273,16 +260,15 @@ class PriceRepository:
 
 
 class OrderRepository:
-    """All CRUD for the 'Orders' collection."""
     def __init__(self, col):
         self.col = col
 
     async def setup_indexes(self):
         await self.col.create_index("order_id", unique=True, background=True)
         await self.col.create_index("user_id", background=True)
-        await self.col.create_index([("status", 1), ("timestamps.updated_at", 1)], background=True)
-        await self.col.create_index("expire_at", expireAfterSeconds=0, background=True)
-        logger.info("Order indexes ensured (including TTL on expire_at).")
+        await self.col.create_index([("status", 1), ("expire_at", 1)], background=True)
+        # ❌ TTL index ဖြုတ်ထားပြီ (manual timeout only)
+        logger.info("Order indexes ensured (NO TTL – manual timeout processing).")
 
     async def create_order(self, order_id: str, user_id, profile_name: str,
                            dia, price_snapshot, item_type: str,
@@ -324,17 +310,11 @@ class OrderRepository:
 
     async def get_timeout_orders(self, limit: int = 50) -> list:
         now = datetime.now(UTC_TZ)
-        pending_cutoff = now - timedelta(minutes=5)
-        payment_cutoff = now - timedelta(minutes=15)
-
-        pending = await self.col.find(
-            {"status": "pending_id", "timestamps.updated_at": {"$lt": pending_cutoff}}
-        ).limit(limit).to_list(length=limit)
-        waiting = await self.col.find(
-            {"status": "waiting_payment", "timestamps.updated_at": {"$lt": payment_cutoff}}
-        ).limit(limit).to_list(length=limit)
-        orders = pending + waiting
-        return orders[:limit]
+        cursor = self.col.find({
+            "status": {"$in": ["pending_id", "waiting_payment", "confirming_id"]},
+            "expire_at": {"$lt": now}
+        }).limit(limit)
+        return await cursor.to_list(length=limit)
 
     async def get_total_users_count(self) -> int:
         try:
@@ -414,18 +394,25 @@ class OrderRepository:
 
 
 class LicenseRepository:
-    """Handles license checks with cache, single‑flight, and remote master fallback."""
     def __init__(self, col, cache: LicenseCache,
                  http_session: Optional[aiohttp.ClientSession],
                  master_api_url: str, secret_token: str, is_client_mode: bool):
         self.col = col
         self.cache = cache
-        self._session = http_session
         self.master_url = master_api_url
         self.secret = secret_token
         self.client_mode = is_client_mode
+        # Lazy session pattern for Render free safety
+        self._session = http_session
+        self._own_session = False   # True if we created it ourselves later
         self._pending: Dict[int, asyncio.Task] = {}
         self._pending_lock = asyncio.Lock()
+
+    async def _ensure_session(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+            self._own_session = True
+            logger.debug("Created internal aiohttp session for license checks.")
 
     async def _check_local(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
         try:
@@ -443,34 +430,21 @@ class LicenseRepository:
     async def _fetch_from_master(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
         if not self.master_url:
             raise ValueError("MASTER_API_URL not set")
+        await self._ensure_session()
         url = f"{self.master_url.rstrip('/')}/api/license/check/{user_id}"
         timeout = aiohttp.ClientTimeout(total=10)
-
-        close_after = False
-        session = self._session
-        if not session:
-            session = aiohttp.ClientSession()
-            close_after = True
         try:
-            async with session.get(url, timeout=timeout,
-                                   headers={"Authorization": f"Bearer {self.secret}"}) as resp:
+            async with self._session.get(url, timeout=timeout,
+                                         headers={"Authorization": f"Bearer {self.secret}"}) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     raise Exception(f"Master API returned {resp.status}: {text}")
                 data = await resp.json()
                 return data.get("valid", False), _ensure_utc(data.get("expiry"))
-        finally:
-            if close_after:
-                await session.close()
+        except Exception:
+            raise
 
-    # ========== ပြင်ဆင်ချက် 1: master fail fallback (cache only, no stale DB) ==========
     async def _fetch_fresh(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
-        """
-        Client mode ဖြစ်ပါက master ကို အရင်စစ်ဆေးပါ။
-        Master မှ valid ဆိုလျှင် local DB ကို update လုပ်ပြီး valid ပြန်ပါ။
-        Master မှ invalid ဆိုလျှင် local document ကို ဖျက်ပြီး invalid ပြန်ပါ။
-        Master ချိတ်ဆက်မှု ပျက်ကွက်ပါက **cache** မှသာ ပြန်ပေးပြီး local DB ဟောင်းနွမ်းမှုကို ရှောင်ရှားပါ။
-        """
         if self.client_mode:
             try:
                 valid_master, expiry_master = await self._fetch_from_master(user_id)
@@ -482,18 +456,14 @@ class LicenseRepository:
                     )
                     return True, expiry_master
                 else:
-                    # master says invalid → remove local doc to avoid stale data
                     await self.col.delete_one({"user_id": user_id})
                     return False, None
             except Exception as e:
                 logger.warning(f"Master fetch failed for {user_id}: {e}")
-                # Fallback to cache (last known good state), never the local DB directly
                 cached = await self.cache.get(user_id)
                 if cached:
                     return cached.get("valid", False), cached.get("expiry")
                 return False, None
-
-        # Standalone mode (no master): use local DB
         return await self._check_local(user_id)
 
     async def is_license_valid(self, user_id: int) -> bool:
@@ -504,23 +474,27 @@ class LicenseRepository:
         cached = await self.cache.get(user_id)
         if cached is not None:
             expiry = cached.get("expiry")
-            if expiry and expiry > datetime.now(UTC_TZ):
+            if cached.get("valid") is True and expiry and expiry > datetime.now(UTC_TZ):
                 return True
-            if not cached.get("valid", False) and not expiry:
+            if cached.get("valid") is False:
                 return False
 
         async with self._pending_lock:
             if user_id in self._pending:
                 task = self._pending[user_id]
             else:
-                task = asyncio.create_task(self._fetch_and_cache(user_id))
-                self._pending[user_id] = task
+                try:
+                    task = asyncio.create_task(self._fetch_and_cache(user_id))
+                    self._pending[user_id] = task
+                except Exception:
+                    logger.error(f"Failed to create fetch task for {user_id}")
+                    return False
         return await task
 
     async def _fetch_and_cache(self, user_id: int) -> bool:
         try:
             valid, expiry = await self._fetch_fresh(user_id)
-            ttl = 86400 if valid else 300
+            ttl = 86400 if valid else 60
             await self.cache.set(user_id, valid, expiry, ttl)
             return valid
         except Exception as e:
@@ -549,7 +523,7 @@ class LicenseRepository:
         except Exception as e:
             logger.warning(f"Background refresh failed for {user_id}: {e}")
             return
-        ttl = 86400 if valid else 300
+        ttl = 86400 if valid else 60
         await self.cache.set(user_id, valid, expiry, ttl)
 
     async def add_or_update(self, user_id, months: int) -> bool:
@@ -591,9 +565,7 @@ class LicenseRepository:
             logger.info(f"Cleaned up {deleted} expired licenses")
         return deleted
 
-    # ========== revoke – delete document ==========
     async def revoke_license(self, user_id: int) -> bool:
-        """လိုင်စင်ကို အပြီးအပိုင် ဖျက်ပစ်ပါ (document အားဖျက်ခြင်း)"""
         user_id = _safe_int_or_log(user_id, "revoke_license")
         if user_id is None:
             return False
@@ -606,9 +578,14 @@ class LicenseRepository:
             logger.error(f"Error revoking license for {user_id}: {e}")
             return False
 
+    async def close(self):
+        if self._own_session and self._session:
+            await self._session.close()
+            self._session = None
+            logger.debug("Internal aiohttp session closed.")
+
 
 class BannedUserRepository:
-    """Manages banned users DB + in‑memory set."""
     def __init__(self, col, banned_set: Set[int]):
         self.col = col
         self.banned_set = banned_set
@@ -663,6 +640,17 @@ class BannedUserRepository:
 class SettingsRepository:
     def __init__(self, col):
         self.col = col
+
+    async def setup_indexes(self):
+        # 🔧 ပြင်ဆင်ချက် - null config_key ဟောင်းများကို ဖျက်ပြီး sparse index ဆောက်ခြင်း
+        try:
+            await self.col.delete_many({"config_key": None})
+        except Exception as e:
+            logger.warning(f"Failed to clean null config_key documents: {e}")
+
+        await self.col.create_index("config_key", unique=True, sparse=True, background=True)
+        await self.col.create_index("setting_type", background=True)
+        logger.info("Settings indexes ensured (sparse unique on config_key).")
 
     async def set_service_status(self, is_open: bool):
         status = "Open" if is_open else "Stop"
@@ -727,15 +715,11 @@ class MonthlyReportRepository:
         return res.deleted_count
 
 
-# ==========================================
-# DatabaseManager (Facade)
-# ==========================================
 class DatabaseManager:
     def __init__(self, uri: str, db_name: str = "DiamondBotDB",
                  http_session: Optional[aiohttp.ClientSession] = None,
                  banned_set: Optional[Set[int]] = None,
                  primary_admin_id: Optional[int] = None):
-        # Mongo connection pool settings optimized for free‑tier / small VPS
         self.client = motor.motor_asyncio.AsyncIOMotorClient(
             uri,
             connect=False,
@@ -745,7 +729,7 @@ class DatabaseManager:
             retryWrites=True,
             retryReads=True,
             maxPoolSize=20,
-            minPoolSize=1,   # ← ပြင်ဆင်ချက် 3: free tier အတွက် 1 သို့လျှော့ချထားပါသည်
+            minPoolSize=1,
             waitQueueTimeoutMS=5000,
             maxIdleTimeMS=60000,
         )
@@ -754,7 +738,6 @@ class DatabaseManager:
         self._banned_set = banned_set if banned_set is not None else set()
         self._primary_admin_id = primary_admin_id
 
-        # Initialize repositories
         self.price_repo      = PriceRepository(self.db['Prices'])
         self.order_repo      = OrderRepository(self.db['Orders'])
         self.license_cache   = LicenseCache()
@@ -795,6 +778,7 @@ class DatabaseManager:
         await self.license_repo.col.create_index("user_id", unique=True, background=True)
         await self.report_repo.setup_indexes()
         await self.banned_repo.setup_indexes()
+        await self.settings_repo.setup_indexes()
         await self.db['nickname_cache'].create_index(
             "timestamp", expireAfterSeconds=86400, background=True
         )
@@ -815,72 +799,29 @@ class DatabaseManager:
 
     async def close(self):
         await self.license_cache.stop_cleanup_task()
+        await self.license_repo.close()
         self.client.close()
         logger.info("DatabaseManager closed.")
 
     async def generate_monthly_report(self, year_month: str) -> dict:
         report_data = await self.order_repo.generate_monthly_report_data(year_month)
 
-        async with await self.client.start_session() as session:
-            try:
-                async with session.start_transaction():
-                    prices = await self.price_repo.col.find(
-                        {"monthly_count": {"$gt": 0}},
-                        session=session
-                    ).to_list(length=None)
+        # No transaction – simple bulk reset on Render free
+        prices = await self.price_repo.get_all_with_monthly_counts()
+        items_sold = []
+        items_to_reset = []
+        for p in prices:
+            item_type_str = "Dia" if p.get("type", "dia") == "dia" else "UC"
+            items_sold.append(f"{p['diamond']} {item_type_str} ({p['monthly_count']})")
+            items_to_reset.append((p["type"], p["diamond"]))
 
-                    items_sold = []
-                    items_to_reset = []
-                    for p in prices:
-                        item_type_str = "Dia" if p.get("type", "dia") == "dia" else "UC"
-                        items_sold.append(f"{p['diamond']} {item_type_str} ({p['monthly_count']})")
-                        items_to_reset.append((p["type"], p["diamond"]))
+        if items_to_reset:
+            await self.price_repo.reset_monthly_counts_bulk(items_to_reset)
 
-                    if items_to_reset:
-                        ops = [
-                            UpdateOne(
-                                {"type": t, "diamond": d},
-                                {"$set": {"monthly_count": 0}}
-                            )
-                            for t, d in items_to_reset
-                        ]
-                        await self.price_repo.col.bulk_write(ops, session=session)
-
-                    items_sold_str = ", ".join(items_sold) if items_sold else "အရောင်းမရှိပါ"
-                    report = {"Total Orders": report_data["total_orders"], "Items Sold": items_sold_str}
-                    await self.report_repo.upsert_report(year_month, report)
-                    return report
-
-            except OperationFailure as e:
-                logger.warning(f"Transaction failed (maybe standalone MongoDB): {e}. Falling back to non-atomic reset.")
-                prices = await self.price_repo.get_all_with_monthly_counts()
-                items_sold = []
-                items_to_reset = []
-                for p in prices:
-                    item_type_str = "Dia" if p.get("type", "dia") == "dia" else "UC"
-                    items_sold.append(f"{p['diamond']} {item_type_str} ({p['monthly_count']})")
-                    items_to_reset.append((p["type"], p["diamond"]))
-                items_sold_str = ", ".join(items_sold) if items_sold else "အရောင်းမရှိပါ"
-                report = {"Total Orders": report_data["total_orders"], "Items Sold": items_sold_str}
-                await self.report_repo.upsert_report(year_month, report)
-                if items_to_reset:
-                    await self.price_repo.reset_monthly_counts_bulk(items_to_reset)
-                return report
-            except Exception as e:
-                logger.error(f"Unexpected error in monthly report: {e}")
-                prices = await self.price_repo.get_all_with_monthly_counts()
-                items_sold = []
-                items_to_reset = []
-                for p in prices:
-                    item_type_str = "Dia" if p.get("type", "dia") == "dia" else "UC"
-                    items_sold.append(f"{p['diamond']} {item_type_str} ({p['monthly_count']})")
-                    items_to_reset.append((p["type"], p["diamond"]))
-                items_sold_str = ", ".join(items_sold) if items_sold else "အရောင်းမရှိပါ"
-                report = {"Total Orders": report_data["total_orders"], "Items Sold": items_sold_str}
-                await self.report_repo.upsert_report(year_month, report)
-                if items_to_reset:
-                    await self.price_repo.reset_monthly_counts_bulk(items_to_reset)
-                return report
+        items_sold_str = ", ".join(items_sold) if items_sold else "အရောင်းမရှိပါ"
+        report = {"Total Orders": report_data["total_orders"], "Items Sold": items_sold_str}
+        await self.report_repo.upsert_report(year_month, report)
+        return report
 
     async def purge_3_months_old_data(self) -> Tuple[int, int]:
         del_orders = await self.order_repo.purge_old_orders(90)
