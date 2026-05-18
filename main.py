@@ -1,35 +1,15 @@
-# main.py (အစအဆုံး – critical fix: call_soon_threadsafe usage)
-"""
-main.py – Production‑ready bot entry point (Render‑optimized).
-- Master ID from hardcoded master.py.
-- Quart web server runs in separate thread with lightweight Motor client.
-- Hypercorn ASGI server.
-- Graceful shutdown using asyncio.Event + signal handlers.
-- Rate limited license check API with IP leak prevention and periodic memory cleanup.
-- Enhanced health check with live DB ping.
-- Race condition mitigation via threading.Event for Quart DB ready.
-- Polling conflict protection.
-- Non-blocking thread join.
-- Background Quart thread health monitor.
-- Safe for external supervisor (Render auto-restart) – no internal restart loop.
-- Startup notification sent only once per process lifetime (guard flag).
-- Proper shutdown ordering: Telegram → Quart → DB → HTTP session.
-- Quart fatal failure triggers process exit using threading.Event (only on crash).
-- Reduced allowed_updates to save memory (string list, correct PTB format).
-- Reduced Telegram connection pool for free‑tier RAM.
-- Extra guards: safe Quart shutdown event set (loop closed), and app.initialize() fail handling.
-"""
-
+# main.py - Final production version (review fixes applied)
 import os
 import sys
-import asyncio
 import logging
 import html
+import asyncio
+import time as _time
 import signal
 import threading
-from datetime import datetime, time
-from functools import wraps
+from datetime import datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
+from functools import wraps
 
 import pytz
 import aiohttp
@@ -50,7 +30,6 @@ from telegram.error import Conflict
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# Load .env if available
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -74,7 +53,7 @@ from handlers import (
 )
 
 # ──────────────────────────────────────
-# Logging Setup (duplication‑free, Render‑friendly)
+# Logging Setup
 # ──────────────────────────────────────
 LOG_FILE = "bot.log"
 MAX_LOG_SIZE = 3 * 1024 * 1024
@@ -147,6 +126,7 @@ RATE_LIMIT_MAX = 10
 RATE_LIMIT_WINDOW = 60
 QUART_READY_TIMEOUT = 10
 RATE_LIMIT_CLEANUP_INTERVAL = 300
+ERROR_DEBOUNCE_SECONDS = 300
 
 TELEGRAM_CONNECT_TIMEOUT = 10.0
 TELEGRAM_READ_TIMEOUT = 30.0
@@ -192,7 +172,7 @@ master_only = role_required("master")
 admin_only  = role_required("admin")
 
 # ──────────────────────────────────────
-# Database & Session Initialization (Main Bot)
+# Database & Session Initialization
 # ──────────────────────────────────────
 async def init_database(application):
     master.initialize_master(admin_ids=ALL_ADMIN_IDS)
@@ -237,7 +217,6 @@ async def init_database(application):
     if not await db.settings_repo.get_config("last_report_month"):
         await db.settings_repo.set_config("last_report_month", current_month)
 
-#    await db.license_repo.background_refresh(PRIMARY_ADMIN_ID)
     application.bot_data['name_check_api'] = NAME_CHECK_API
     if NAME_CHECK_API:
         logger.info("Name Check API configured.")
@@ -302,10 +281,10 @@ async def purge_old_data_job(context):
             logger.info(f"3‑month purge: {del_reports} reports removed.")
 
 # ──────────────────────────────────────
-# Startup Notifications (race‑condition safe)
+# Startup Notifications
 # ──────────────────────────────────────
 _startup_notification_sent = False
-_startup_lock = None  # Created in main_async
+_startup_lock = None
 
 async def _notify_startup_task(app):
     global _startup_notification_sent, _startup_lock
@@ -385,12 +364,32 @@ async def _notify_master_api(bot, master_api_url, secret, admin_id, session):
 # ──────────────────────────────────────
 # Global Error Handler
 # ──────────────────────────────────────
+_last_error_time = {}
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     if error:
         logger.error(f"Unhandled error: {type(error).__name__}", exc_info=True)
     else:
         logger.error("Global error: unknown error")
+        return
+
+    now = _time.time()
+    error_type = type(error).__name__
+    last = _last_error_time.get(error_type, 0)
+    if now - last >= ERROR_DEBOUNCE_SECONDS:
+        _last_error_time[error_type] = now
+        admin_id = context.bot_data.get('admin_id', PRIMARY_ADMIN_ID)
+        short_msg = f"⚠️ <b>Error:</b> <code>{error_type}</code>\n{str(error)[:200]}"
+        if update and isinstance(update, Update) and update.callback_query:
+            try:
+                await update.callback_query.answer("An error occurred. Admin notified.", show_alert=False)
+            except Exception:
+                pass
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=short_msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error notification failed: {e}")
 
 # ──────────────────────────────────────
 # Quart Web Server
@@ -441,6 +440,7 @@ async def api_notify_startup():
         logger.error(f"Notify startup failed: {e}")
         return jsonify({"error": str(e)}), 500
 
+# Quart Motor client
 quart_motor_client = None
 quart_licenses_col = None
 quart_loop = None
@@ -659,12 +659,7 @@ async def main_async():
     global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, quart_fatal_event
     global _startup_notification_sent, _startup_lock, app
 
-    # 🔴 Duplicate instance guard (Render safe)
-    if os.environ.get("BOT_RUNNING") == "1":
-        logger.critical("Another bot instance detected (BOT_RUNNING=1). Exiting.")
-        return
-    os.environ["BOT_RUNNING"] = "1"
-
+    # Removed BOT_RUNNING env guard – real protection comes from delete_webhook + Conflict handler
     _startup_notification_sent = False
     quart_ready_event.clear()
     quart_fatal_event.clear()
@@ -684,7 +679,6 @@ async def main_async():
     monitor_task = None
 
     try:
-        # ---------- Startup ----------
         if not await init_database(app):
             logger.critical("Database initialization failed. Exiting.")
             return
@@ -694,6 +688,7 @@ async def main_async():
 
         await setup_jobs(app)
 
+        # Admin commands
         admin_commands = [
             ("setdia", set_dia_command),
             ("setuc", set_uc_command),
@@ -714,20 +709,25 @@ async def main_async():
         app.add_handler(CommandHandler("paid", master_paid_command))
         app.add_handler(CommandHandler("license", master_license_add_command))
 
+        # Conversation handler with TIMEOUT state + both message and callback handling
         conv_handler = ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(wrap_with_license(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
-                CallbackQueryHandler(wrap_with_license(show_items), pattern=r"^(show_dia|show_uc)$"),
-                CallbackQueryHandler(wrap_with_license(send_welcome), pattern=r"^back_to_main$"),
-                CommandHandler("start", wrap_with_license(send_welcome)),
+                CallbackQueryHandler(step1_selection, pattern=r"^price_(dia|uc)_.+$"),
+                CallbackQueryHandler(show_items, pattern=r"^(show_dia|show_uc)$"),
+                CallbackQueryHandler(send_welcome, pattern=r"^back_to_main$"),
+                CommandHandler("start", send_welcome),
             ],
             states={
-                WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_with_license(step2_id_entry))],
-                WAIT_CONFIRMATION: [CallbackQueryHandler(wrap_with_license(step3_validation), pattern="^(confirm_id|back_id)$")],
-                WAIT_PAYMENT: [MessageHandler(filters.PHOTO, wrap_with_license(step4_payment))],
+                WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, step2_id_entry)],
+                WAIT_CONFIRMATION: [CallbackQueryHandler(step3_validation, pattern="^(confirm_id|back_id)$")],
+                WAIT_PAYMENT: [MessageHandler(filters.PHOTO, step4_payment)],
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, timeout_handler),
+                    CallbackQueryHandler(timeout_handler)
+                ]
             },
             fallbacks=[
-                CommandHandler("start", wrap_with_license(send_welcome)),
+                CommandHandler("start", send_welcome),
                 MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, timeout_handler),
             ],
             conversation_timeout=CONVERSATION_TIMEOUT,
@@ -739,10 +739,11 @@ async def main_async():
         app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin_"))
         app.add_handler(CallbackQueryHandler(user_cancel_handler, pattern=r"^cancel_user_"))
         app.add_handler(CallbackQueryHandler(license_callback_handler, pattern=r"^license_"))
-        app.add_handler(CallbackQueryHandler(wrap_with_license(new_order_callback_handler), pattern=r"^new_order$"))
+        app.add_handler(CallbackQueryHandler(new_order_callback_handler, pattern=r"^new_order$"))
 
         app.add_error_handler(global_error_handler)
 
+        # Start Quart in separate thread
         quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
         quart_thread.start()
 
@@ -756,7 +757,6 @@ async def main_async():
             return
 
         await app.initialize()
-        # ✅ Critical fix: clear any leftover webhook to prevent Conflict 409
         await app.bot.delete_webhook(drop_pending_updates=True)
 
         quart_app.config['BOT_INSTANCE'] = app.bot
@@ -766,13 +766,11 @@ async def main_async():
             logger.critical("Updater unavailable. Exiting.")
             return
 
-        # 🔴 Updater already running check (tightened)
         if app.updater.running:
             logger.critical("Updater already running. Another process may be alive. Exiting.")
             return
 
         try:
-            # 🔴 CRITICAL: drop_pending_updates=True to avoid conflict
             await app.updater.start_polling(
                 drop_pending_updates=True,
                 allowed_updates=["message", "callback_query"]
@@ -814,7 +812,6 @@ async def main_async():
             pass
 
     finally:
-        # ---------- Shutdown cleanup ----------
         logger.info("Shutting down…")
         bot_running = False
 
@@ -841,7 +838,6 @@ async def main_async():
             except asyncio.CancelledError:
                 pass
 
-        # Stop Quart safely – CRITICAL FIX: pass the function, not the result
         if quart_loop and quart_shutdown_event:
             try:
                 quart_loop.call_soon_threadsafe(quart_shutdown_event.set)
@@ -864,10 +860,6 @@ async def main_async():
                     logger.info("HTTP session closed.")
                 except Exception as e:
                     logger.warning(f"HTTP session close failed: {e}")
-
-        # Clean up duplicate guard flag
-        if "BOT_RUNNING" in os.environ:
-            del os.environ["BOT_RUNNING"]
 
         logger.info("Bot shutdown complete.")
 
