@@ -1,4 +1,4 @@
-# handlers.py - Final production version (all fixes applied + string-safe datetime)
+# handlers.py - Final production version (refresh fallback + status message)
 import re
 import asyncio
 import uuid
@@ -33,9 +33,7 @@ class OrderStatus(str, Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
 
-# ──────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────
+# ── Helpers ──
 def get_db(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
     if not db:
@@ -970,7 +968,6 @@ async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # License / Paid Command
 # ──────────────────────────────────────
 
-# ✅ FIXED: uses _ensure_utc from database.py (handles strings, naive, aware)
 def get_remaining_time_str(expiry_date) -> str:
     if not expiry_date:
         return "N/A"
@@ -1122,7 +1119,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⚠️ မသိသော command", show_alert=True)
 
 # ──────────────────────────────────────
-# Refresh Command
+# Refresh Command (FIX with API fallback & status message)
 # ──────────────────────────────────────
 _LAST_CLEANUP_DATE = None
 
@@ -1162,14 +1159,41 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update, context)
     admin_id = db.primary_admin_id
 
+    # Show checking message
+    status_msg = await update.message.reply_text("⏳ လိုင်စင်စစ်ဆေးနေပါသည်...")
+
+    # Invalidate cache first
     await db.license_repo.cache.invalidate(admin_id)
-    valid = await db.license_repo.is_license_valid(admin_id)
+
+    valid = False
+    expiry = None
+
+    try:
+        # Try master API (or local check depending on client_mode)
+        valid = await db.license_repo.is_license_valid(admin_id)
+        if valid:
+            try:
+                _, expiry = await db.license_repo.check_license_local(admin_id)
+            except AttributeError:
+                lic_doc = await db.licenses.find_one({"user_id": admin_id})
+                expiry = lic_doc.get("expiry_date") if lic_doc else None
+    except Exception as e:
+        logger.warning(f"License API failed during refresh, using local fallback: {e}")
+        # Fallback to direct local check
+        lic_doc = await db.licenses.find_one({"user_id": admin_id})
+        if lic_doc:
+            expiry = lic_doc.get("expiry_date")
+            expiry = _ensure_utc(expiry)
+            if expiry and expiry > datetime.now(timezone.utc):
+                valid = True
+            else:
+                valid = False
+
+    # Remove status message
+    await safe_delete_message(status_msg, context)
+
+    # Prepare response
     if valid:
-        try:
-            _, expiry = await db.license_repo.check_license_local(admin_id)
-        except AttributeError:
-            lic_doc = await db.licenses.find_one({"user_id": admin_id})
-            expiry = lic_doc.get("expiry_date") if lic_doc else None
         time_str = get_remaining_time_str(expiry)
         msg = f"✅ လိုင်စင်ရှိနေပါသည်။\n⏳ သက်တမ်းကျန်: {time_str}"
     else:
