@@ -1,4 +1,4 @@
-# main.py - Final production version (review fixes applied)
+# main.py - Fixed license check endpoint to avoid 500 errors
 import os
 import sys
 import logging
@@ -7,7 +7,7 @@ import asyncio
 import time as _time
 import signal
 import threading
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone  # <-- added timezone
 from logging.handlers import RotatingFileHandler
 from functools import wraps
 
@@ -38,7 +38,7 @@ except ImportError:
 
 import master
 from master import _REAL_MASTER_ID as MASTER_ID
-from database import DatabaseManager, UTC_TZ
+from database import DatabaseManager, UTC_TZ, _ensure_utc  # <-- import _ensure_utc
 import handlers
 from handlers import (
     WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT,
@@ -555,12 +555,21 @@ async def api_license_check(user_id: int):
     if not doc:
         return jsonify({"valid": False, "expiry": None}), 200
 
+    # ──────────────── FIX: safe expire check ────────────────
     expiry = doc.get("expiry_date")
-    now_utc = datetime.now(UTC_TZ)
-    if expiry and expiry > now_utc:
-        return jsonify({"valid": True, "expiry": expiry.isoformat()}), 200
-    else:
-        return jsonify({"valid": False, "expiry": expiry.isoformat() if expiry else None}), 200
+    try:
+        # Convert to aware UTC datetime (handles None, string, naive)
+        expiry = _ensure_utc(expiry)
+        now_utc = datetime.now(timezone.utc)
+        if expiry is not None and expiry > now_utc:
+            return jsonify({"valid": True, "expiry": expiry.isoformat()}), 200
+        else:
+            return jsonify({"valid": False, "expiry": expiry.isoformat() if expiry else None}), 200
+    except Exception as e:
+        logger.error(f"License check processing error for {user_id}: {e}")
+        # Fallback: return as invalid
+        return jsonify({"valid": False, "expiry": None}), 200
+    # ────────────────────────────────────────────────────────
 
 def start_quart():
     global quart_loop, quart_shutdown_event, _rate_limit_lock, _rate_limit_dict, rate_cleanup_task
@@ -659,7 +668,6 @@ async def main_async():
     global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, quart_fatal_event
     global _startup_notification_sent, _startup_lock, app
 
-    # Removed BOT_RUNNING env guard – real protection comes from delete_webhook + Conflict handler
     _startup_notification_sent = False
     quart_ready_event.clear()
     quart_fatal_event.clear()
