@@ -1,12 +1,13 @@
-# handlers.py (ပြင်ဆင်မှုများပါဝင်သည်)
+# handlers.py - Final production version (all fixes applied + string-safe datetime)
 import re
 import asyncio
 import uuid
 import logging
 import html
-import traceback
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from enum import Enum
+from functools import wraps
+
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
@@ -14,7 +15,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes, ConversationHandler
 
 import master
-from database import UTC_TZ
+from database import UTC_TZ, _ensure_utc  # <-- Import _ensure_utc from database.py
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class OrderStatus(str, Enum):
     CANCELLED = "cancelled"
 
 # ──────────────────────────────────────
-# Helpers (ပြင်ဆင်ချက်များ)
+# Helpers
 # ──────────────────────────────────────
 def get_db(context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get('db')
@@ -66,21 +67,34 @@ async def safe_delete_message(message, context: ContextTypes.DEFAULT_TYPE = None
         logger.warning(f"Unexpected error during delete: {e}")
 
 def escape_html(text: str) -> str:
-    return html.escape(str(text)) if text else text
+    if text is None:
+        return ""
+    return html.escape(str(text))
 
-# ✅ ပြင်ဆင်ချက် 1: handle_errors တွင် error message ပို့စဉ် nested error မဖြစ်အောင်
 def handle_errors(handler_func):
+    @wraps(handler_func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             return await handler_func(update, context)
         except Exception as e:
             logger.exception(f"Unhandled error in {handler_func.__name__}: {e}")
+            try:
+                admin_id = get_admin_id(context)
+                user_info = ""
+                if update and update.effective_user:
+                    user_info = f"User: {update.effective_user.id} | "
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"⚠️ Error in {handler_func.__name__}\n{user_info}{str(e)[:300]}"
+                )
+            except Exception as notify_err:
+                logger.error(f"Failed to send error notification: {notify_err}")
             error_msg = "⚠️ စနစ်တွင် အမှားအယွင်းတစ်ခု ဖြစ်ပွားသွားပါသည်။ ကျေးဇူးပြု၍ ခဏနေမှ ထပ်မံကြိုးစားပါ။"
-            if update.effective_chat:
+            if update and update.effective_chat:
                 try:
                     await context.bot.send_message(chat_id=update.effective_chat.id, text=error_msg)
-                except Exception as send_err:
-                    logger.error(f"Failed to send error message to user: {send_err}")
+                except Exception:
+                    pass
             return ConversationHandler.END
     return wrapped
 
@@ -88,16 +102,15 @@ async def check_license_logic(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.effective_user:
         return False
     user_id = update.effective_user.id
-
     if master.is_master(user_id):
         return True
-
     db = get_db(context)
     if not db:
         return False
     return await db.license_repo.is_license_valid(get_admin_id(context))
 
 def wrap_with_license(handler_func):
+    @wraps(handler_func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = get_db(context)
         if not db:
@@ -119,7 +132,7 @@ def wrap_with_license(handler_func):
 def validate_game_id(item_type: str, text: str) -> tuple:
     text = text.strip()
     if item_type == "dia":
-        match = re.match(r"^(\d{5,20})\s+(\d{3,6})$", text)
+        match = re.match(r"^(\d{5,20})[\s\-|()]+(\d{3,6})$", text)
         if match:
             return match.groups()
         return None
@@ -129,13 +142,13 @@ def validate_game_id(item_type: str, text: str) -> tuple:
             return (match.group(1), "")
         return None
 
-# ✅ ပြင်ဆင်ချက် 3: safe_user_mention last_name only case အတွက် ပြုပြင်ထားသည်
 def safe_user_mention(user_id: int, first_name: str = None, last_name: str = None, fallback: str = "User") -> str:
+    uid = int(user_id)
     if first_name or last_name:
         name = f"{first_name or ''} {last_name or ''}".strip()
     else:
         name = fallback
-    return f'<a href="tg://user?id={user_id}">{escape_html(name)}</a>'
+    return f'<a href="tg://user?id={uid}">{escape_html(name)}</a>'
 
 def build_caption_from_order(order: dict, status_text: str, user_first_name: str = None, user_last_name: str = None) -> str:
     order_id = escape_html(order.get("order_id", "N/A"))
@@ -260,7 +273,6 @@ async def set_cached_nickname(db, game_id: str, zone_id: str, nickname: str, reg
         logger.error(f"Failed to cache nickname: {e}")
         return False
 
-# ✅ ပြင်ဆင်ချက် 2: fetch_game_nickname တွင် JSON decode error ဖမ်းထားသည်
 async def fetch_game_nickname(context: ContextTypes.DEFAULT_TYPE, api_url: str, game_id: str, zone_id: str = "") -> tuple:
     session = context.bot_data.get('http_session')
     own_session = False
@@ -440,7 +452,7 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = validate_game_id(item_type, text)
     if not val:
         if item_type == "dia":
-            await update.message.reply_text("❌ Diamond အတွက် Format: `123456789 1234`")
+            await update.message.reply_text("❌ Diamond အတွက် Format: `123456789 1234` (သို့) `123456789-1234`")
         else:
             await update.message.reply_text("❌ UC အတွက် Format: `123456789` (ID တစ်ခုတည်း)")
         return WAIT_GAME_ID
@@ -704,14 +716,14 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     elif data.startswith("admin_manual_"):
         result = await db.orders.update_one(
-            {"order_id": order_id},
+            {"order_id": order_id, "status": {"$ne": OrderStatus.COMPLETED}},
             {"$set": {
                 "status": OrderStatus.COMPLETED,
                 "timestamps.updated_at": datetime.now(UTC_TZ)
             }}
         )
         if result.modified_count == 0:
-            await query.answer("⚠️ အော်ဒါကို ပြင်ဆင်ပြီးဖြစ်နိုင်ပါသည်။", show_alert=True)
+            await query.answer("⚠️ အော်ဒါသည် ပြီးဆုံးနေပြီး သို့မဟုတ် မတွေ့ပါ။", show_alert=True)
             return
 
         if order.get("status") != OrderStatus.PROCESSING:
@@ -812,7 +824,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ သုံးစွဲသူများထံ စတင်ပို့နေပါသည်...")
 
-    batch_size = 20
+    batch_size = 10
     batch = []
     success = 0
     total = 0
@@ -836,7 +848,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Broadcast failed to {uid}: {e}")
             batch = []
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
 
     if batch:
         for uid in batch:
@@ -957,10 +969,15 @@ async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ──────────────────────────────────────
 # License / Paid Command
 # ──────────────────────────────────────
+
+# ✅ FIXED: uses _ensure_utc from database.py (handles strings, naive, aware)
 def get_remaining_time_str(expiry_date) -> str:
     if not expiry_date:
         return "N/A"
-    diff = expiry_date - datetime.now(UTC_TZ)
+    expiry_date = _ensure_utc(expiry_date)
+    if expiry_date is None:
+        return "N/A"
+    diff = expiry_date - datetime.now(timezone.utc)
     if diff.days < 0:
         return "Expired"
     months = diff.days // 30
@@ -1055,10 +1072,9 @@ async def _handle_license_add(query, db, target, months):
     await _handle_license_view(query, db, target)
 
 async def _handle_license_revoke(query, db, target):
-    # 🔧 ပြုပြင်ချက် - LicenseRepository ကိုသာ သုံးပါ
     success = await db.license_repo.revoke_license(target)
     if success:
-        confirm_msg = f"❌ User <code>{target}</code> ၏ လိုင်စင်ကို ပိတ်လိုက်ပါပြီ။ (ရက်ကျန်မရှိတော့ပါ)"
+        confirm_msg = f"❌ User <code>{target}</code> ၏ လိုင်စင်ကို ပိတ်လိုက်ပါပြီ။"
     else:
         confirm_msg = "⚠️ လိုင်စင်ပိတ်ရာတွင် အမှားအယွင်းရှိပါသည်။"
     await query.message.reply_text(confirm_msg, parse_mode=ADMIN_PARSE_MODE)
@@ -1076,7 +1092,6 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     data = query.data
 
-    # 🔧 ပြုပြင်ချက် - တိတိကျကျ callback parse လုပ်ခြင်း
     if data.startswith("license_view_"):
         target = int(data.split("_")[-1])
         await _handle_license_view(query, db, target)
@@ -1085,7 +1100,6 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await _handle_license_main_list(query, db)
 
     elif data.startswith("license_add_"):
-        # format: license_add_{months}_{user_id}
         try:
             _, _, months_str, target_str = data.split("_")
             months = int(months_str)
@@ -1096,7 +1110,6 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await _handle_license_add(query, db, target, months)
 
     elif data.startswith("license_revoke_"):
-        # format: license_revoke_{user_id}
         try:
             _, _, target_str = data.split("_")
             target = int(target_str)
@@ -1109,7 +1122,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⚠️ မသိသော command", show_alert=True)
 
 # ──────────────────────────────────────
-# Refresh Command (ပြင်ဆင်ချက် - cache invalidate အရင်လုပ်)
+# Refresh Command
 # ──────────────────────────────────────
 _LAST_CLEANUP_DATE = None
 
@@ -1149,11 +1162,14 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update, context)
     admin_id = db.primary_admin_id
 
-    # 🔧 ပြုပြင်ချက် - cache ကို အရင် invalidate လုပ်ပြီးမှ စစ်ဆေးပါ
     await db.license_repo.cache.invalidate(admin_id)
     valid = await db.license_repo.is_license_valid(admin_id)
     if valid:
-        _, expiry = await db.license_repo._check_local(admin_id)
+        try:
+            _, expiry = await db.license_repo.check_license_local(admin_id)
+        except AttributeError:
+            lic_doc = await db.licenses.find_one({"user_id": admin_id})
+            expiry = lic_doc.get("expiry_date") if lic_doc else None
         time_str = get_remaining_time_str(expiry)
         msg = f"✅ လိုင်စင်ရှိနေပါသည်။\n⏳ သက်တမ်းကျန်: {time_str}"
     else:
