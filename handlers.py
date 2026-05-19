@@ -1,9 +1,12 @@
-# handlers.py - Final production version (refresh fallback + status message)
+# handlers.py - Render‑optimized final version (broadcast uses Users collection, safe context cleanup, compiled regex, minimal typing)
 import re
 import asyncio
 import uuid
 import logging
 import html
+import hashlib
+import time as _time
+from urllib.parse import quote
 from datetime import datetime, date, timedelta, timezone
 from enum import Enum
 from functools import wraps
@@ -11,16 +14,21 @@ from functools import wraps
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, RetryAfter, TimedOut, NetworkError
 from telegram.ext import ContextTypes, ConversationHandler
 
 import master
-from database import UTC_TZ, _ensure_utc  # <-- Import _ensure_utc from database.py
+from database import UTC_TZ, _ensure_utc
 
 logger = logging.getLogger(__name__)
 
 WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT = range(3)
 ADMIN_PARSE_MODE = ParseMode.HTML
+
+# Compiled regex patterns (CPU light)
+DIA_ID_RE = re.compile(r"^(\d{5,20})[\s\-()]+(\d{3,6})\)?$")
+UC_ID_RE = re.compile(r"^(\d{5,20})$")
+SET_PRICE_RE = re.compile(r"/set(dia|uc)\s+(.+)", re.IGNORECASE)
 
 class OrderStatus(str, Enum):
     PENDING_ID = "pending_id"
@@ -68,6 +76,31 @@ def escape_html(text: str) -> str:
     if text is None:
         return ""
     return html.escape(str(text))
+
+def retry_on_telegram_error(max_retries=3, initial_delay=1.0):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = initial_delay
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except (TimedOut, NetworkError) as e:
+                    logger.warning(f"Telegram network error (attempt {attempt}/{max_retries}): {e}")
+                    last_exception = e
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                except RetryAfter as e:
+                    wait = e.retry_after
+                    logger.warning(f"Telegram RetryAfter {wait}s (attempt {attempt}/{max_retries})")
+                    await asyncio.sleep(wait)
+                    last_exception = e
+                except TelegramError as e:
+                    raise
+            raise last_exception
+        return wrapper
+    return decorator
 
 def handle_errors(handler_func):
     @wraps(handler_func)
@@ -127,15 +160,28 @@ def wrap_with_license(handler_func):
         return await handler_func(update, context)
     return wrapped
 
+# ── Price hash helpers (user‑scoped, sha256/12) ──
+def _price_hash(diamond_str: str) -> str:
+    return hashlib.sha256(diamond_str.encode()).hexdigest()[:12]
+
+def _build_price_hash_map(prices: list) -> dict:
+    mapping = {}
+    for p in prices:
+        amount = p.get('amount') or p.get('diamond', '')
+        amount_str = str(amount).strip()
+        if amount_str:
+            mapping[_price_hash(amount_str)] = amount_str
+    return mapping
+
 def validate_game_id(item_type: str, text: str) -> tuple:
     text = text.strip()
     if item_type == "dia":
-        match = re.match(r"^(\d{5,20})[\s\-|()]+(\d{3,6})$", text)
+        match = DIA_ID_RE.match(text)
         if match:
             return match.groups()
         return None
     else:
-        match = re.match(r"^(\d{5,20})$", text)
+        match = UC_ID_RE.match(text)
         if match:
             return (match.group(1), "")
         return None
@@ -144,33 +190,35 @@ def safe_user_mention(user_id: int, first_name: str = None, last_name: str = Non
     uid = int(user_id)
     if first_name or last_name:
         name = f"{first_name or ''} {last_name or ''}".strip()
+        name = escape_html(name[:64])
     else:
-        name = fallback
-    return f'<a href="tg://user?id={uid}">{escape_html(name)}</a>'
+        name = escape_html(fallback[:64])
+    return f'<a href="tg://user?id={uid}">{name}</a>'
 
 def build_caption_from_order(order: dict, status_text: str, user_first_name: str = None, user_last_name: str = None) -> str:
     order_id = escape_html(order.get("order_id", "N/A"))
     user_id = order.get("user_id", 0)
     first = user_first_name or order.get("profile_name", str(user_id))
     last = user_last_name
-
     qty = order.get("order_info", {}).get("quantity", "N/A")
     item = order.get("order_info", {}).get("item_type", "dia")
     game_id = order.get("order_info", {}).get("game_id", "N/A")
     zone_id = order.get("order_info", {}).get("zone_id", "")
     nickname = order.get("order_info", {}).get("nickname", "")
+    # Pre‑escape for repeated use
+    safe_qty = escape_html(qty)
+    safe_game_id = escape_html(game_id)
+    safe_zone_id = escape_html(zone_id) if zone_id else ""
+    safe_nick = escape_html(nickname) if nickname and nickname != "N/A" else None
 
     emoji = "💎" if item == "dia" else "💵"
-    game_str = escape_html(game_id)
-    if zone_id:
-        game_str += f" ({escape_html(zone_id)})"
+    game_str = safe_game_id
+    if safe_zone_id:
+        game_str += f" ({safe_zone_id})"
 
     name_line = f"👤 ဝယ်သူ: {safe_user_mention(user_id, first, last)}"
     id_line = f'🆔 User ID: <a href="tg://user?id={user_id}">{user_id}</a>'
-    if nickname and nickname != "N/A":
-        ig_line = f"👤 IG Name: <b>{escape_html(nickname)}</b>\n"
-    else:
-        ig_line = "👤 IG Name: <i>(Check Failed)</i>\n"
+    ig_line = f"👤 IG Name: <b>{safe_nick}</b>\n" if safe_nick else "👤 IG Name: <i>(Check Failed)</i>\n"
 
     return (
         f"📦 Order ID: <code>{order_id}</code>\n"
@@ -178,7 +226,7 @@ def build_caption_from_order(order: dict, status_text: str, user_first_name: str
         f"{id_line}\n"
         f"{ig_line}"
         f"🆔 Game ID: <code>{game_str}</code>\n"
-        f"{emoji} ပစ္စည်း: {escape_html(qty)} {item.upper()}\n"
+        f"{emoji} ပစ္စည်း: {safe_qty} {item.upper()}\n"
         f"💰 အခြေအနေ: {escape_html(status_text)}"
     )
 
@@ -211,7 +259,14 @@ async def edit_admin_message(query, new_caption: str, reply_markup=None):
         if "message is not modified" in str(e).lower():
             pass
         else:
-            logger.warning(f"edit_admin_message BadRequest: {e}")
+            try:
+                await query.message.edit_text(
+                    text=new_caption,
+                    parse_mode=ADMIN_PARSE_MODE,
+                    reply_markup=reply_markup
+                )
+            except Exception as e2:
+                logger.warning(f"edit_admin_message fallback failed: {e2}")
     except Exception as e:
         logger.error(f"Error editing admin message: {e}")
 
@@ -222,9 +277,18 @@ async def _send_db_error(update: Update):
     elif update.callback_query:
         await update.callback_query.answer(msg, show_alert=True)
 
-# ──────────────────────────────────────
-# Timeout Handler
-# ──────────────────────────────────────
+# ── Order context cleanup (safe key removal) ──
+ORDER_KEYS = (
+    "current_order_id", "item_type", "quantity",
+    "temp_name", "temp_region", "last_payment_time",
+    "price_hash_map"
+)
+
+def clear_order_context(context):
+    for key in ORDER_KEYS:
+        context.user_data.pop(key, None)
+
+# ── Timeout Handler ──
 TIMEOUT_SECONDS = 300
 
 async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -241,12 +305,10 @@ async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat_id=update.effective_chat.id,
             text="⏰ အချိန်ကျော်သွားပါပြီ။ ၅ မိနစ်အတွင်း Game ID ထည့်သွင်းခြင်း မရှိသောကြောင့် အော်ဒါကို ပယ်ဖျက်လိုက်ပါသည်။\nကျေးဇူးပြု၍ /start မှ ပြန်လည်စတင်ပေးပါ။"
         )
-    context.user_data.clear()
+    clear_order_context(context)
     return ConversationHandler.END
 
-# ──────────────────────────────────────
-# Name Check API & Cache
-# ──────────────────────────────────────
+# ── Name Check API & Cache ──
 NICKNAME_CACHE_HOURS = 24
 
 async def get_cached_nickname(db, game_id: str, zone_id: str):
@@ -254,8 +316,10 @@ async def get_cached_nickname(db, game_id: str, zone_id: str):
     doc = await col.find_one({"game_id": game_id, "zone_id": zone_id})
     if doc:
         ts = doc.get("timestamp")
-        if ts and (datetime.now(UTC_TZ) - ts) < timedelta(hours=NICKNAME_CACHE_HOURS):
-            return doc.get("nickname"), doc.get("region", "Unknown"), ts
+        if ts:
+            ts = _ensure_utc(ts)
+            if ts and (datetime.now(UTC_TZ) - ts) < timedelta(hours=NICKNAME_CACHE_HOURS):
+                return doc.get("nickname"), doc.get("region", "Unknown"), ts
     return None
 
 async def set_cached_nickname(db, game_id: str, zone_id: str, nickname: str, region: str = "Unknown"):
@@ -279,11 +343,13 @@ async def fetch_game_nickname(context: ContextTypes.DEFAULT_TYPE, api_url: str, 
         own_session = True
     try:
         url = api_url
+        safe_game_id = quote(game_id, safe='')
+        safe_zone_id = quote(zone_id, safe='')
         if "{id}" in url and "{zone}" in url:
-            url = api_url.format(id=game_id, zone=zone_id)
+            url = api_url.format(id=safe_game_id, zone=safe_zone_id)
         else:
-            url = url.replace("USER_ID", game_id).replace("ZONE_ID", zone_id)
-            url = url.replace("{id}", game_id).replace("{zone}", zone_id)
+            url = url.replace("USER_ID", safe_game_id).replace("ZONE_ID", safe_zone_id)
+            url = url.replace("{id}", safe_game_id).replace("{zone}", safe_zone_id)
         timeout = aiohttp.ClientTimeout(total=5)
         async with session.get(url, timeout=timeout) as resp:
             if resp.status == 200:
@@ -313,7 +379,15 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_typing(update, context)
     db = get_db(context)
     admin_id = db.primary_admin_id
-    if not await db.settings_repo.get_service_status() and update.effective_user.id != admin_id:
+    user_id = update.effective_user.id
+
+    # ⚡️ Register user in lightweight Users collection for broadcast
+    try:
+        await db.users_repo.upsert_user(user_id)
+    except Exception:
+        pass
+
+    if not await db.settings_repo.get_service_status() and user_id != admin_id:
         text = "⚠️ Service ခေတ္တရပ်ထားပါသည်"
         if update.message:
             await update.message.reply_text(text)
@@ -360,12 +434,15 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     sorted_prices = sort_price_items(prices)
+    hash_map = _build_price_hash_map(sorted_prices)
+    context.user_data['price_hash_map'] = hash_map   # per user
+
     keyboard = []
     row = []
     for p in sorted_prices:
         amount = p.get('amount') or p.get('diamond')
         btn_text = str(amount).strip()
-        cb_data = f"price_{item_type}_{amount}"
+        cb_data = f"price_{item_type}_{_price_hash(btn_text)}"
         if len(btn_text) > 18:
             if row:
                 keyboard.append(row)
@@ -405,7 +482,17 @@ async def step1_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 3:
         await query.message.reply_text("⚠️ Invalid selection")
         return ConversationHandler.END
-    item_type, amount_str = parts[1], parts[2]
+    item_type = parts[1]
+    hash_val = parts[2]
+    hash_map = context.user_data.get('price_hash_map', {})
+    amount_str = hash_map.get(hash_val)
+    # 🧹 Remove hash map from user data after use
+    context.user_data.pop('price_hash_map', None)
+
+    if not amount_str:
+        await query.message.reply_text("⚠️ ဈေးနှုန်းမတွေ့ပါ။ ပြန်စပါ။")
+        return ConversationHandler.END
+
     price_data = await db.price_repo.get_price_by_amount(item_type, amount_str)
     if not price_data:
         await query.message.reply_text("⚠️ မတွေ့ပါ")
@@ -559,6 +646,15 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 ငွေလွှဲ Screenshot (ပုံ) သာ ပို့ပေးရပါမည်။")
         return WAIT_PAYMENT
 
+    # Anti-spam cooldown
+    user_id = update.effective_user.id
+    last_time = context.user_data.get('last_payment_time', 0)
+    now_ts = _time.time()
+    if now_ts - last_time < 10:
+        await update.message.reply_text("⏳ ကျေးဇူးပြု၍ ၁၀ စက္ကန့်ခန့်စောင့်ပြီးမှ ထပ်ပို့ပါ။")
+        return WAIT_PAYMENT
+    context.user_data['last_payment_time'] = now_ts
+
     order_id = context.user_data.get('current_order_id')
     if not order_id:
         await update.message.reply_text("⚠️ အော်ဒါအချက်အလက် ပျောက်ဆုံးသွားပါသဖြင့် ကျေးဇူးပြု၍ /start မှ ပြန်လည်စတင်ပါ။")
@@ -569,11 +665,15 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏰ အော်ဒါသက်တမ်းကုန်သွားပါပြီ။ /start မှ ပြန်စတင်ပါ။")
         return ConversationHandler.END
 
-    if order.get("status") != OrderStatus.WAITING_PAYMENT:
+    # Atomic transition to VERIFYING
+    result = await db.orders.update_one(
+        {"order_id": order_id, "status": OrderStatus.WAITING_PAYMENT},
+        {"$set": {"status": OrderStatus.VERIFYING, "timestamps.updated_at": datetime.now(UTC_TZ)}}
+    )
+    if result.modified_count == 0:
         await update.message.reply_text("⚠️ ဤအော်ဒါကို လက်ခံပြီးသား သို့မဟုတ် အခြေအနေပြောင်းသွားပါပြီ။")
         return ConversationHandler.END
 
-    await db.order_repo.update_order_status(order_id, OrderStatus.VERIFYING)
     user = update.effective_user
     qty = context.user_data.get('quantity', 'N/A')
     item = context.user_data.get('item_type', 'dia')
@@ -584,16 +684,31 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data=f"admin_reject_{order_id}")
     ]])
 
+    @retry_on_telegram_error(max_retries=3)
+    async def send_admin_photo(chat_id, photo, caption, reply_markup):
+        return await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            parse_mode=ADMIN_PARSE_MODE,
+            reply_markup=reply_markup
+        )
+
     try:
-        sent = await context.bot.send_photo(chat_id=admin_id,
-                                            photo=update.message.photo[-1].file_id,
-                                            caption=caption,
-                                            parse_mode=ADMIN_PARSE_MODE,
-                                            reply_markup=admin_markup)
+        sent = await send_admin_photo(
+            chat_id=admin_id,
+            photo=update.message.photo[-1].file_id,
+            caption=caption,
+            reply_markup=admin_markup
+        )
         await db.order_repo.set_order_admin_msg_id(order_id, sent.message_id)
     except Exception as e:
-        logger.error(f"Failed to forward to admin: {e}")
-        await db.order_repo.update_order_status(order_id, OrderStatus.WAITING_PAYMENT)
+        logger.error(f"Failed to forward to admin after retries: {e}")
+        # Revert to WAITING_PAYMENT
+        await db.orders.update_one(
+            {"order_id": order_id, "status": OrderStatus.VERIFYING},
+            {"$set": {"status": OrderStatus.WAITING_PAYMENT, "timestamps.updated_at": datetime.now(UTC_TZ)}}
+        )
         await update.message.reply_text("⚠️ Admin ထံ အချက်အလက်ပို့ရာတွင် ချို့ယွင်းသွားပါသည်။ ကျေးဇူးပြု၍ ငွေလွှဲပုံကို ထပ်မံပို့ပေးပါ။")
         return WAIT_PAYMENT
 
@@ -609,7 +724,7 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ <b>လူကြီးမင်း၏ Order တင်မှု အောင်မြင်ပါသည်။</b>"
     )
     await update.message.reply_text(summary, parse_mode="HTML")
-    context.user_data.clear()
+    clear_order_context(context)
     return ConversationHandler.END
 
 # ──────────────────────────────────────
@@ -632,10 +747,12 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
     data = query.data
-    parts = data.split("_")
-    if len(parts) < 2:
+    try:
+        prefix, order_id = data.rsplit("_", 1)
+    except ValueError:
+        await query.answer("Invalid data", show_alert=True)
         return
-    order_id = parts[-1]
+
     order = await db.order_repo.get_order(order_id)
     if not order:
         await query.answer("အော်ဒါ မတွေ့ပါ။", show_alert=True)
@@ -737,16 +854,25 @@ async def user_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     db = get_db(context)
     query = update.callback_query
     await query.answer()
-    order_id = query.data.split("_")[-1]
+    data = query.data
+    try:
+        _, order_id = data.rsplit("_", 1)
+    except ValueError:
+        await query.message.reply_text("Invalid cancel data")
+        return
     order = await db.order_repo.get_order(order_id)
     if not order:
         await query.message.edit_text("⏰ အော်ဒါမရှိတော့ပါ။")
         return
-    if order['status'] != OrderStatus.WAITING_PAYMENT:
-        await query.message.reply_text("⚠️ ယခုအဆင့်တွင် Cancel ပြုလုပ်၍မရပါ။")
+
+    result = await db.orders.delete_one({
+        "order_id": order_id,
+        "status": OrderStatus.WAITING_PAYMENT
+    })
+    if result.deleted_count == 0:
+        await query.message.reply_text("⚠️ အော်ဒါကို လက်ခံပြီးသားဖြစ်၍ Cancel မရတော့ပါ။")
         return
 
-    await db.order_repo.delete_order(order_id)
     admin_msg_id = order.get("admin_msg_id")
     if admin_msg_id:
         admin_id = db.primary_admin_id
@@ -777,12 +903,11 @@ async def user_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 @handle_errors
 @wrap_with_license
 async def new_order_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_typing(update, context)
     await update.callback_query.answer()
     return await send_welcome(update, context)
 
 # ──────────────────────────────────────
-# Admin Commands
+# Admin Commands (typing removed for speed)
 # ──────────────────────────────────────
 @handle_errors
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -817,38 +942,22 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ပို့ချင်သော Message ကို Reply လုပ်ပြီး /post ကိုသုံးပါ။")
         return
 
-    pipeline = [{"$group": {"_id": "$user_id"}}]
-    cursor = db.orders.aggregate(pipeline)
-
     await update.message.reply_text("⏳ သုံးစွဲသူများထံ စတင်ပို့နေပါသည်...")
 
+    try:
+        user_ids = await db.users_repo.get_all_user_ids()
+    except Exception as e:
+        logger.error(f"Failed to fetch user list: {e}")
+        await update.message.reply_text("⚠️ User list မရယူနိုင်ပါ။")
+        return
+
     batch_size = 10
-    batch = []
     success = 0
-    total = 0
+    total = len(user_ids)
+    failed = 0
 
-    async for doc in cursor:
-        uid = doc["_id"]
-        if uid is None:
-            continue
-        batch.append(uid)
-        total += 1
-
-        if len(batch) >= batch_size:
-            for uid in batch:
-                try:
-                    await context.bot.copy_message(
-                        chat_id=uid,
-                        from_chat_id=update.message.chat_id,
-                        message_id=update.message.reply_to_message.message_id
-                    )
-                    success += 1
-                except Exception as e:
-                    logger.warning(f"Broadcast failed to {uid}: {e}")
-            batch = []
-            await asyncio.sleep(1.5)
-
-    if batch:
+    for i in range(0, total, batch_size):
+        batch = user_ids[i:i+batch_size]
         for uid in batch:
             try:
                 await context.bot.copy_message(
@@ -857,10 +966,13 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=update.message.reply_to_message.message_id
                 )
                 success += 1
-            except Exception as e:
-                logger.warning(f"Broadcast failed to {uid}: {e}")
+            except Exception:
+                failed += 1
+        await asyncio.sleep(1.5)
 
-    await update.message.reply_text(f"✅ ပြီးဆုံးပါသည်။ အောင်မြင်မှု - {success}/{total}")
+    await update.message.reply_text(
+        f"✅ ပြီးဆုံးပါသည်။ အောင်မြင်မှု - {success}/{total} (Failed: {failed})"
+    )
 
 @handle_errors
 async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -896,9 +1008,9 @@ async def set_dia_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.settings_repo.set_config("dia_msg_id", update.message.reply_to_message.message_id)
         await update.message.reply_text("✅ Dia ဈေးနှုန်းပုံ Message ID သိမ်းဆည်းပြီးပါပြီ။")
         return
-    match = re.match(r"/setdia\s+(.+)", update.message.text)
+    match = SET_PRICE_RE.match(update.message.text)
     if match:
-        amount = match.group(1).strip()
+        amount = match.group(2).strip()
         await db.price_repo.add_or_update_price(amount, "dia")
         await update.message.reply_text(f"✅ Dia {amount} ထည့်သွင်းပြီးပါပြီ။")
     else:
@@ -915,9 +1027,9 @@ async def set_uc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.settings_repo.set_config("uc_msg_id", update.message.reply_to_message.message_id)
         await update.message.reply_text("✅ UC ဈေးနှုန်းပုံ Message ID သိမ်းဆည်းပြီးပါပြီ။")
         return
-    match = re.match(r"/setuc\s+(.+)", update.message.text)
+    match = SET_PRICE_RE.match(update.message.text)
     if match:
-        amount = match.group(1).strip()
+        amount = match.group(2).strip()
         await db.price_repo.add_or_update_price(amount, "uc")
         await update.message.reply_text(f"✅ UC {amount} ထည့်သွင်းပြီးပါပြီ။")
     else:
@@ -967,7 +1079,6 @@ async def check_price_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ──────────────────────────────────────
 # License / Paid Command
 # ──────────────────────────────────────
-
 def get_remaining_time_str(expiry_date) -> str:
     if not expiry_date:
         return "N/A"
@@ -1005,7 +1116,7 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         parse_mode="Markdown")
         try:
             await context.bot.send_message(chat_id=admin_id,
-                                           text=f"/license_added {target} {months}")
+                                           text=f"/license_added {int(target)} {int(months)}")
         except Exception as e:
             logger.error(f"License signal failed: {e}")
         return
@@ -1090,7 +1201,11 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
     data = query.data
 
     if data.startswith("license_view_"):
-        target = int(data.split("_")[-1])
+        try:
+            target = int(data.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            await query.answer("Invalid data", show_alert=True)
+            return
         await _handle_license_view(query, db, target)
 
     elif data == "license_main_list":
@@ -1098,9 +1213,11 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     elif data.startswith("license_add_"):
         try:
-            _, _, months_str, target_str = data.split("_")
-            months = int(months_str)
-            target = int(target_str)
+            parts = data.split("_")
+            if len(parts) != 4:
+                raise ValueError
+            months = int(parts[2])
+            target = int(parts[3])
         except (ValueError, IndexError):
             await query.answer("⚠️ ဒေတာ မှားယွင်းနေပါသည်။", show_alert=True)
             return
@@ -1108,8 +1225,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
 
     elif data.startswith("license_revoke_"):
         try:
-            _, _, target_str = data.split("_")
-            target = int(target_str)
+            target = int(data.rsplit("_", 1)[-1])
         except (ValueError, IndexError):
             await query.answer("⚠️ ဒေတာ မှားယွင်းနေပါသည်။", show_alert=True)
             return
@@ -1119,7 +1235,7 @@ async def license_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⚠️ မသိသော command", show_alert=True)
 
 # ──────────────────────────────────────
-# Refresh Command (FIX with API fallback & status message)
+# Refresh Command
 # ──────────────────────────────────────
 _LAST_CLEANUP_DATE = None
 
@@ -1132,6 +1248,11 @@ def check_refresh_limit(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> boo
         limits = {uid: rec for uid, rec in limits.items() if rec["date"] == today}
         context.bot_data["refresh_limits"] = limits
         _LAST_CLEANUP_DATE = today
+
+    # aggressive cleanup if dict grows too large
+    if len(limits) > 500:
+        limits.clear()
+        context.bot_data["refresh_limits"] = {}
 
     rec = limits.get(user_id, {"date": today, "count": 0})
     if rec["date"] != today:
@@ -1156,48 +1277,20 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ တစ်ရက်ကို ၃ ကြိမ်သာ Refresh လုပ်ခွင့်ရှိပါသည်။")
         return
 
-    await send_typing(update, context)
+    await send_typing(update, context)   # keep only for this longer operation
     admin_id = db.primary_admin_id
 
-    # Show checking message
     status_msg = await update.message.reply_text("⏳ လိုင်စင်စစ်ဆေးနေပါသည်...")
 
-    # Invalidate cache first
-    await db.license_repo.cache.invalidate(admin_id)
-
-    valid = False
-    expiry = None
-
-    try:
-        # Try master API (or local check depending on client_mode)
-        valid = await db.license_repo.is_license_valid(admin_id)
-        if valid:
-            try:
-                _, expiry = await db.license_repo.check_license_local(admin_id)
-            except AttributeError:
-                lic_doc = await db.licenses.find_one({"user_id": admin_id})
-                expiry = lic_doc.get("expiry_date") if lic_doc else None
-    except Exception as e:
-        logger.warning(f"License API failed during refresh, using local fallback: {e}")
-        # Fallback to direct local check
-        lic_doc = await db.licenses.find_one({"user_id": admin_id})
-        if lic_doc:
-            expiry = lic_doc.get("expiry_date")
-            expiry = _ensure_utc(expiry)
-            if expiry and expiry > datetime.now(timezone.utc):
-                valid = True
-            else:
-                valid = False
-
-    # Remove status message
-    await safe_delete_message(status_msg, context)
-
-    # Prepare response
+    valid = await db.license_repo.force_refresh(admin_id)
     if valid:
+        _, expiry = await db.license_repo._check_local(admin_id)
         time_str = get_remaining_time_str(expiry)
         msg = f"✅ လိုင်စင်ရှိနေပါသည်။\n⏳ သက်တမ်းကျန်: {time_str}"
     else:
         msg = "❌ လိုင်စင် မရှိပါ သို့မဟုတ် သက်တမ်းကုန်နေပါသည်။"
+
+    await safe_delete_message(status_msg, context)
     await update.message.reply_text(msg)
 
 # ──────────────────────────────────────
@@ -1207,10 +1300,18 @@ async def check_timeouts(context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
     if not db:
         return
+    admin_id = get_admin_id(context)
     try:
         orders = await db.order_repo.get_timeout_orders()
         for o in orders:
-            await db.order_repo.delete_order(o['order_id'])
+            order_id = o['order_id']
+            admin_msg_id = o.get('admin_msg_id')
+            if admin_msg_id:
+                try:
+                    await context.bot.delete_message(chat_id=admin_id, message_id=admin_msg_id)
+                except Exception as e:
+                    logger.debug(f"Could not delete admin message for {order_id}: {e}")
+            await db.order_repo.delete_order(order_id)
     except Exception as e:
         logger.error(f"Timeout check error: {e}")
 
