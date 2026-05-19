@@ -1,10 +1,4 @@
 # master.py
-"""
-master.py – Clean authority management & decorators for the bot.
-Provides Master/Admin checks, ban checking, and reusable decorators.
-Hardcoded MASTER_ID – cannot be overridden via environment.
-"""
-
 import logging
 from functools import wraps
 from typing import Optional, List
@@ -17,24 +11,26 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────
 # 🔒 Hardcoded Master ID (ဘယ်တော့မှ env ကနေ ပြောင်းမရ)
 # ──────────────────────────────────────
-_REAL_MASTER_ID: int = 6510049765   # သင့်ရဲ့ တကယ့် Master ID ကို ထည့်ပါ
-_ADMIN_IDS: set = set()
+_REAL_MASTER_ID: int = 6510049765
+MASTER_ID = _REAL_MASTER_ID          # ✅ public export for main.py
 
+_ADMIN_IDS: set = {_REAL_MASTER_ID}
+_initialized = False
 
 def initialize_master(admin_ids: Optional[List[int]] = None) -> None:
     """
     Must be called before bot start.
     - Master ID is always _REAL_MASTER_ID (hardcoded).
     - Additional admin IDs can be passed (Owner etc.).
-    Will not overwrite once already initialised.
+    Can be called multiple times – new admins will be merged.
     """
-    global _ADMIN_IDS
-    if _ADMIN_IDS is not None and _ADMIN_IDS != set():
-        logger.warning("Master already initialized. Ignoring duplicate call.")
+    global _ADMIN_IDS, _initialized
+    if admin_ids:
+        _ADMIN_IDS.update(admin_ids)
+    if _initialized:
+        logger.info("Master already initialized; admins merged.")
         return
-
-    _ADMIN_IDS = set(admin_ids) if admin_ids else set()
-    _ADMIN_IDS.add(_REAL_MASTER_ID)   # Master ကို admin စာရင်းထဲ အမြဲထည့်
+    _initialized = True
     logger.info(f"Master ID (hardcoded): {_REAL_MASTER_ID}, Admins: {_ADMIN_IDS}")
 
 
@@ -107,13 +103,13 @@ def check_ban(func):
             return await func(update, context)
 
         db = context.bot_data.get('db')
-        if db:
+        if db and hasattr(db, "banned_repo"):
             try:
                 if await db.banned_repo.is_banned(uid):
                     await reply_denied(update, get_access_denied_message(banned=True))
                     return ConversationHandler.END
-            except Exception as e:
-                logger.error(f"Ban check failed: {e}")
+            except Exception:
+                logger.exception("Ban check failed")
         return await func(update, context)
     return wrapper
 
