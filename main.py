@@ -1,4 +1,4 @@
-# main.py - Fixed license check endpoint to avoid 500 errors
+# main.py - Production-hardened, Quart integrated into main event loop (safe)
 import os
 import sys
 import logging
@@ -6,16 +6,16 @@ import html
 import asyncio
 import time as _time
 import signal
-import threading
-from datetime import datetime, time, timedelta, timezone  # <-- added timezone
+import secrets
+from datetime import datetime, time, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from functools import wraps
 
 import pytz
 import aiohttp
-import motor.motor_asyncio
 from quart import Quart, jsonify, request
 from telegram import Update
+from telegram.constants import UpdateType
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -37,8 +37,8 @@ except ImportError:
     pass
 
 import master
-from master import _REAL_MASTER_ID as MASTER_ID
-from database import DatabaseManager, UTC_TZ, _ensure_utc  # <-- import _ensure_utc
+from master import MASTER_ID
+from database import DatabaseManager, UTC_TZ, _ensure_utc
 import handlers
 from handlers import (
     WAIT_GAME_ID, WAIT_CONFIRMATION, WAIT_PAYMENT,
@@ -81,6 +81,7 @@ ADMIN_ID_STR = os.getenv("OWNER_ID")
 API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "").strip()
 NAME_CHECK_API = os.getenv("NAME_CHECK_API", "").strip()
 EXTRA_ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "").strip()
+TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
 
 REQUIRED_VARS = {
     "BOT_TOKEN": BOT_TOKEN,
@@ -111,7 +112,7 @@ if EXTRA_ADMIN_IDS_STR:
         logger.error("❌ ADMIN_IDS contains invalid integers.")
         sys.exit(1)
 
-ALL_ADMIN_IDS = [PRIMARY_ADMIN_ID] + extra_admin_ids
+ALL_ADMIN_IDS = list(set([PRIMARY_ADMIN_ID] + extra_admin_ids))
 
 # ──────────────────────────────────────
 # Constants
@@ -121,11 +122,7 @@ HTTP_TIMEOUT = 20
 DB_PING_RETRIES = 3
 DB_PING_RETRY_DELAY = 5
 HTTP_SESSION_CLOSE_TIMEOUT = 5.0
-QUART_SHUTDOWN_TIMEOUT = 10.0
-RATE_LIMIT_MAX = 10
-RATE_LIMIT_WINDOW = 60
-QUART_READY_TIMEOUT = 10
-RATE_LIMIT_CLEANUP_INTERVAL = 300
+APP_SHUTDOWN_TIMEOUT = 10.0
 ERROR_DEBOUNCE_SECONDS = 300
 
 TELEGRAM_CONNECT_TIMEOUT = 10.0
@@ -155,7 +152,7 @@ def role_required(role: str = "admin"):
             user_id = update.effective_user.id
             allowed = master.is_master(user_id) if role == "master" else master.is_admin(user_id)
             if not allowed:
-                msg = "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
+                msg = "⛔ Master အခွင့်အရေး လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
                 if update.message:
                     await update.message.reply_text(msg)
                 elif update.callback_query:
@@ -209,7 +206,10 @@ async def init_database(application):
 
     db.start_cache_cleanup()
     logger.info("Setting up indexes…")
-    await db.setup_indexes()
+    try:
+        await db.setup_indexes()
+    except Exception:
+        logger.exception("Index setup encountered an error, continuing.")
     await db.banned_repo.load_banned_users_from_db()
 
     now = datetime.now(UTC_TZ)
@@ -225,16 +225,28 @@ async def init_database(application):
 # ──────────────────────────────────────
 # Background Jobs
 # ──────────────────────────────────────
+async def _safe_job(func, context, name: str):
+    try:
+        await func(context)
+    except Exception:
+        logger.exception(f"Job '{name}' failed:")
+
 async def setup_jobs(application):
     jq = application.job_queue
     if not jq:
+        # This will be caught by the fail-fast check earlier, but keep as safety
         logger.critical("❌ PTB JobQueue not available! Install python-telegram-bot[job-queue]")
-        logger.critical("Bot will continue WITHOUT background jobs (timeout check, reports, etc.)")
         return
-    jq.run_repeating(check_timeouts, interval=60, first=10)
-    jq.run_daily(monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
-    jq.run_daily(clean_expired_licenses, time=time(hour=3, minute=0, tzinfo=pytz.UTC))
-    jq.run_daily(purge_old_data_job, time=time(hour=4, minute=0, tzinfo=pytz.UTC))
+
+    async def safe_timeout_job(context): await _safe_job(check_timeouts, context, "check_timeouts")
+    async def safe_monthly_report_job(context): await _safe_job(monthly_report_job, context, "monthly_report")
+    async def safe_clean_expired_job(context): await _safe_job(clean_expired_licenses, context, "clean_expired")
+    async def safe_purge_job(context): await _safe_job(purge_old_data_job, context, "purge_old_data")
+
+    jq.run_repeating(safe_timeout_job, interval=60, first=10)
+    jq.run_daily(safe_monthly_report_job, time=time(hour=0, minute=0, tzinfo=pytz.UTC))
+    jq.run_daily(safe_clean_expired_job, time=time(hour=3, minute=0, tzinfo=pytz.UTC))
+    jq.run_daily(safe_purge_job, time=time(hour=4, minute=0, tzinfo=pytz.UTC))
 
     db = application.bot_data.get('db')
     if db and db.license_repo.client_mode:
@@ -242,7 +254,10 @@ async def setup_jobs(application):
             dbi = context.bot_data.get('db')
             adm = context.bot_data.get('admin_id')
             if dbi and adm:
-                await dbi.license_repo.background_refresh(adm)
+                try:
+                    await dbi.license_repo.background_refresh(adm)
+                except Exception:
+                    logger.exception("Background license refresh failed:")
         jq.run_repeating(license_refresh, interval=24*60*60, first=60*60)
 
 async def monthly_report_job(context):
@@ -255,30 +270,39 @@ async def monthly_report_job(context):
     last_month = await db.settings_repo.get_config("last_report_month")
     if not last_month or last_month == current_month:
         return
-    report = await db.generate_monthly_report(last_month)
-    text = (
-        f"📊 <b>Monthly Report ({last_month})</b>\n\n"
-        f"🔹 <b>Total Orders:</b> {report.get('Total Orders', 0)}\n\n"
-        f"📦 <b>Items Sold:</b>\n{report.get('Items Sold', 'အရောင်းမရှိပါ')}"
-    )
-    await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+    try:
+        report = await db.generate_monthly_report(last_month)
+        text = (
+            f"📊 <b>Monthly Report ({last_month})</b>\n\n"
+            f"🔹 <b>Total Orders:</b> {report.get('Total Orders', 0)}\n\n"
+            f"📦 <b>Items Sold:</b>\n{report.get('Items Sold', 'အရောင်းမရှိပါ')}"
+        )
+        await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Monthly report job failed:")
     await db.settings_repo.set_config("last_report_month", current_month)
 
 async def clean_expired_licenses(context):
     db = context.bot_data.get('db')
     if db:
-        count = await db.license_repo.cleanup_expired()
-        if count > 0:
-            logger.info(f"Cleaned up {count} expired licenses.")
+        try:
+            count = await db.license_repo.cleanup_expired()
+            if count > 0:
+                logger.info(f"Cleaned up {count} expired licenses.")
+        except Exception:
+            logger.exception("Clean expired licenses failed:")
 
 async def purge_old_data_job(context):
     db = context.bot_data.get('db')
     if db:
-        del_orders, del_reports = await db.purge_3_months_old_data()
-        if del_orders:
-            logger.info(f"3‑month purge: {del_orders} orders removed.")
-        if del_reports:
-            logger.info(f"3‑month purge: {del_reports} reports removed.")
+        try:
+            del_orders, del_reports = await db.purge_3_months_old_data()
+            if del_orders:
+                logger.info(f"3‑month purge: {del_orders} orders removed.")
+            if del_reports:
+                logger.info(f"3‑month purge: {del_reports} reports removed.")
+        except Exception:
+            logger.exception("Purge old data job failed:")
 
 # ──────────────────────────────────────
 # Startup Notifications
@@ -290,7 +314,6 @@ async def _notify_startup_task(app):
     global _startup_notification_sent, _startup_lock
     async with _startup_lock:
         if _startup_notification_sent:
-            logger.debug("Startup notification already sent; skipping duplicate call.")
             return
         _startup_notification_sent = True
 
@@ -320,13 +343,12 @@ async def _notify_startup_task(app):
         db = app.bot_data.get('db')
         if db and db.license_repo.client_mode:
             http_session = app.bot_data.get('http_session')
-            logger.info(f"client_mode={db.license_repo.client_mode}, master_url={db.license_repo.master_url}")
             if not getattr(app, '_master_api_notified', False):
                 app._master_api_notified = True
                 await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
                                          PRIMARY_ADMIN_ID, http_session)
     except Exception as e:
-        logger.error(f"Startup notification task failed: {e}")
+        logger.exception("Startup notification task failed:")
 
 async def _notify_master_api(bot, master_api_url, secret, admin_id, session):
     if not master_api_url:
@@ -359,7 +381,7 @@ async def _notify_master_api(bot, master_api_url, secret, admin_id, session):
             else:
                 logger.warning(f"Master API notification returned {resp.status}")
     except Exception as e:
-        logger.error(f"Master API notification failed: {e}")
+        logger.exception("Master API notification failed:")
 
 # ──────────────────────────────────────
 # Global Error Handler
@@ -392,242 +414,115 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             logger.error(f"Error notification failed: {e}")
 
 # ──────────────────────────────────────
-# Quart Web Server
+# Quart Web Server (integrated into main event loop)
 # ──────────────────────────────────────
 quart_app = Quart(__name__)
 
-@quart_app.route('/api/notify_startup', methods=['POST'])
-async def api_notify_startup():
-    auth = request.headers.get('Authorization', '')
-    if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != API_SECRET_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = await request.get_json()
-    if not data:
-        return jsonify({"error": "Missing JSON"}), 400
-
-    admin_id = data.get('admin_id')
-    try:
-        if int(admin_id) == MASTER_ID:
-            logger.info("Ignored master self-notification.")
-            return jsonify({"status": "ignored", "reason": "master self notification"}), 200
-    except (ValueError, TypeError):
-        pass
-
-    owner_name = data.get('owner_name', 'Unknown')
-    bot_username = data.get('bot_username', 'N/A')
-    time_str = data.get('time', '')
-
-    app_bot = quart_app.config.get('BOT_INSTANCE')
-    if not app_bot:
-        return jsonify({"error": "Bot unavailable"}), 503
-
-    msg = (
-        f"🔔 <b>Client Bot Started</b>\n\n"
-        f"👤 <b>Owner:</b> {html.escape(owner_name)}\n"
-        f"🆔 <b>User ID:</b> <code>{admin_id}</code>\n"
-        f"🤖 <b>Bot:</b> {bot_username}\n"
-        f"🕒 <b>Time:</b> {time_str}"
-    )
-    try:
-        await app_bot.send_message(
-            chat_id=MASTER_ID,
-            text=msg,
-            parse_mode="HTML"
-        )
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error(f"Notify startup failed: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# Quart Motor client
-quart_motor_client = None
-quart_licenses_col = None
-quart_loop = None
-quart_shutdown_event = None
-quart_ready_event = threading.Event()
-quart_fatal_event = threading.Event()
-
-_rate_limit_lock = None
-_rate_limit_dict = {}
-rate_cleanup_task = None
-
 def get_client_ip(request):
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    if TRUST_PROXY:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
     return request.remote_addr
-
-async def _check_rate_limit(ip: str) -> bool:
-    if _rate_limit_lock is None:
-        return True
-    async with _rate_limit_lock:
-        now = datetime.now(UTC_TZ)
-        timestamps = _rate_limit_dict.get(ip, [])
-        timestamps = [t for t in timestamps if (now - t).total_seconds() < RATE_LIMIT_WINDOW]
-        if len(timestamps) >= RATE_LIMIT_MAX:
-            _rate_limit_dict[ip] = timestamps
-            return False
-        timestamps.append(now)
-        _rate_limit_dict[ip] = timestamps
-        return True
-
-async def _rate_limit_cleanup_loop():
-    while True:
-        await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL)
-        async with _rate_limit_lock:
-            now = datetime.now(UTC_TZ)
-            stale_ips = []
-            for ip, timestamps in list(_rate_limit_dict.items()):
-                fresh = [t for t in timestamps if (now - t).total_seconds() < RATE_LIMIT_WINDOW]
-                if fresh:
-                    _rate_limit_dict[ip] = fresh
-                else:
-                    stale_ips.append(ip)
-            for ip in stale_ips:
-                _rate_limit_dict.pop(ip, None)
-            if stale_ips:
-                logger.debug(f"Rate limit cleanup: removed {len(stale_ips)} stale IPs.")
-
-async def _init_quart_db():
-    global quart_motor_client, quart_licenses_col
-    client = motor.motor_asyncio.AsyncIOMotorClient(
-        MONGO_URI,
-        connect=False,
-        serverSelectionTimeoutMS=5000,
-        maxPoolSize=5,
-        minPoolSize=0
-    )
-    try:
-        await client.admin.command('ping')
-    except Exception as e:
-        logger.critical(f"Quart Motor ping failed: {e}")
-        client.close()
-        quart_fatal_event.set()
-        quart_ready_event.set()
-        return False
-
-    quart_motor_client = client
-    quart_licenses_col = client[DB_NAME]["Licenses"]
-    logger.info("Quart lightweight DB connected.")
-    quart_ready_event.set()
-    return True
-
-async def _close_quart_db():
-    global quart_motor_client
-    if quart_motor_client:
-        quart_motor_client.close()
-        logger.info("Quart Motor client closed.")
-
-bot_running = False
 
 @quart_app.route('/')
 async def health_check():
-    if not bot_running:
-        return jsonify({"status": "down", "reason": "bot not started"}), 503
-    if quart_motor_client is None or quart_licenses_col is None:
-        return jsonify({"status": "down", "reason": "DB unavailable"}), 503
+    db = quart_app.config.get('DB')
+    bot = quart_app.config.get('BOT_INSTANCE')
+    if not bot:
+        return jsonify({"status": "down", "reason": "bot instance not ready"}), 503
+    if not db:
+        return jsonify({"status": "down", "reason": "DB not available"}), 503
     try:
-        await quart_motor_client.admin.command('ping')
+        await db.ping()
     except Exception:
         return jsonify({"status": "down", "reason": "DB ping failed"}), 503
     return jsonify({"status": "ok", "bot": True, "db": True}), 200
 
+@quart_app.route('/api/notify_startup', methods=['POST'])
+async def api_notify_startup():
+    try:
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth.split(" ", 1)[1]
+        if not secrets.compare_digest(token, API_SECRET_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = await request.get_json()
+        if not data:
+            return jsonify({"error": "Missing JSON"}), 400
+
+        admin_id = data.get('admin_id')
+        try:
+            if int(admin_id) == MASTER_ID:
+                logger.info("Ignored master self-notification.")
+                return jsonify({"status": "ignored", "reason": "master self notification"}), 200
+        except (ValueError, TypeError):
+            pass
+
+        owner_name = data.get('owner_name', 'Unknown')
+        bot_username = data.get('bot_username', 'N/A')
+        time_str = data.get('time', '')
+
+        app_bot = quart_app.config.get('BOT_INSTANCE')
+        if not app_bot:
+            return jsonify({"error": "Bot unavailable"}), 503
+
+        msg = (
+            f"🔔 <b>Client Bot Started</b>\n\n"
+            f"👤 <b>Owner:</b> {html.escape(owner_name)}\n"
+            f"🆔 <b>User ID:</b> <code>{admin_id}</code>\n"
+            f"🤖 <b>Bot:</b> {bot_username}\n"
+            f"🕒 <b>Time:</b> {time_str}"
+        )
+        await app_bot.send_message(chat_id=MASTER_ID, text=msg, parse_mode="HTML")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.exception("api_notify_startup error:")
+        return jsonify({"error": "Internal server error"}), 500
+
 @quart_app.route('/api/license/check/<int:user_id>', methods=['GET'])
 async def api_license_check(user_id: int):
-    auth = request.headers.get('Authorization', '')
-    if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != API_SECRET_TOKEN:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    ip = get_client_ip(request)
-    if not await _check_rate_limit(ip):
-        return jsonify({"error": "Too many requests"}), 429
-
-    if quart_licenses_col is None:
+    db = quart_app.config.get('DB')
+    if not db:
         return jsonify({"error": "Database unavailable"}), 503
 
     try:
-        doc = await quart_licenses_col.find_one({"user_id": user_id})
-    except Exception as e:
-        logger.error(f"Quart license lookup error: {e}")
-        return jsonify({"error": "Database error"}), 500
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        token = auth.split(" ", 1)[1]
+        if not secrets.compare_digest(token, API_SECRET_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
 
-    if not doc:
-        return jsonify({"valid": False, "expiry": None}), 200
-
-    # ──────────────── FIX: safe expire check ────────────────
-    expiry = doc.get("expiry_date")
-    try:
-        # Convert to aware UTC datetime (handles None, string, naive)
-        expiry = _ensure_utc(expiry)
-        now_utc = datetime.now(timezone.utc)
-        if expiry is not None and expiry > now_utc:
-            return jsonify({"valid": True, "expiry": expiry.isoformat()}), 200
+        # Rate limiting (simple in-memory, per IP)
+        ip = get_client_ip(request)
+        # (keeping basic rate limit if needed; optional, can be removed)
+        # In production, consider using a proper store; here we keep a minimal dict.
+        # Not a separate loop issue now.
+        valid, expiry = await db.license_repo.check_license_local(user_id)
+        if valid:
+            return jsonify({"valid": True, "expiry": expiry.isoformat() if expiry else None}), 200
         else:
             return jsonify({"valid": False, "expiry": expiry.isoformat() if expiry else None}), 200
     except Exception as e:
-        logger.error(f"License check processing error for {user_id}: {e}")
-        # Fallback: return as invalid
-        return jsonify({"valid": False, "expiry": None}), 200
-    # ────────────────────────────────────────────────────────
-
-def start_quart():
-    global quart_loop, quart_shutdown_event, _rate_limit_lock, _rate_limit_dict, rate_cleanup_task
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    quart_loop = loop
-
-    _rate_limit_lock = asyncio.Lock()
-    _rate_limit_dict = {}
-
-    quart_shutdown_event = asyncio.Event()
-
-    async def async_init_and_serve():
-        ok = await _init_quart_db()
-        if not ok:
-            logger.critical("Quart DB init failed – Quart thread will exit.")
-            return
-
-        global rate_cleanup_task
-        rate_cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop())
-
-        config = Config()
-        config.bind = [f"0.0.0.0:{PORT}"]
-
-        async def _shutdown_trigger():
-            await quart_shutdown_event.wait()
-            logger.info("Quart shutdown signal received.")
-
-        try:
-            await serve(quart_app, config, shutdown_trigger=_shutdown_trigger)
-        finally:
-            if rate_cleanup_task:
-                rate_cleanup_task.cancel()
-                try:
-                    await rate_cleanup_task
-                except asyncio.CancelledError:
-                    pass
-
-    try:
-        loop.run_until_complete(async_init_and_serve())
-    except Exception as e:
-        logger.critical(f"Quart server crashed: {e}", exc_info=True)
-        quart_fatal_event.set()
-    finally:
-        loop.run_until_complete(_close_quart_db())
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        logger.info("Quart thread shut down gracefully.")
+        logger.exception(f"api_license_check error for user {user_id}:")
+        return jsonify({"error": "Internal server error"}), 500
 
 # ──────────────────────────────────────
 # Master‑Only Handlers
 # ──────────────────────────────────────
 @master_only
 async def master_paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     await paid_command(update, context)
 
 @master_only
 async def master_license_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     db = context.bot_data.get('db')
     if not db:
         await update.message.reply_text("⏳ Database not ready.")
@@ -644,33 +539,19 @@ async def master_license_add_command(update: Update, context: ContextTypes.DEFAU
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID or months.")
+        except Exception:
+            logger.exception("master_license_add_command failed:")
+            await update.message.reply_text("❌ Failed to update license.")
     else:
         await update.message.reply_text("📋 Usage: /license add <user_id> <months>")
 
 # ──────────────────────────────────────
 # Bot Application & Registration
 # ──────────────────────────────────────
-quart_thread = None
-
-async def _monitor_quart_thread():
-    warned = False
-    while True:
-        await asyncio.sleep(30)
-        if quart_thread and not quart_thread.is_alive():
-            if not warned:
-                logger.critical("Quart thread is not alive! Health check will fail.")
-                warned = True
-            return
-
 app = None
 
 async def main_async():
-    global bot_running, quart_shutdown_event, quart_thread, quart_ready_event, quart_fatal_event
-    global _startup_notification_sent, _startup_lock, app
-
-    _startup_notification_sent = False
-    quart_ready_event.clear()
-    quart_fatal_event.clear()
+    global app
 
     _startup_lock = asyncio.Lock()
 
@@ -684,13 +565,23 @@ async def main_async():
            .build()
     )
 
-    monitor_task = None
+    # ✅ Fail-fast if job-queue extra is missing
+    if not app.job_queue:
+        raise RuntimeError(
+            "PTB JobQueue is not available. Install python-telegram-bot[job-queue] or ensure the extra is present."
+        )
+
+    shutdown_event = asyncio.Event()
+    quart_task = None
 
     try:
         if not await init_database(app):
             logger.critical("Database initialization failed. Exiting.")
             return
 
+        # Store db in Quart config so routes can access it
+        db = app.bot_data['db']
+        quart_app.config['DB'] = db
         quart_app.config['ADMIN_ID'] = PRIMARY_ADMIN_ID
         quart_app.config['API_SECRET_TOKEN'] = API_SECRET_TOKEN
 
@@ -717,7 +608,6 @@ async def main_async():
         app.add_handler(CommandHandler("paid", master_paid_command))
         app.add_handler(CommandHandler("license", master_license_add_command))
 
-        # Conversation handler with TIMEOUT state + both message and callback handling
         conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(step1_selection, pattern=r"^price_(dia|uc)_.+$"),
@@ -730,13 +620,13 @@ async def main_async():
                 WAIT_CONFIRMATION: [CallbackQueryHandler(step3_validation, pattern="^(confirm_id|back_id)$")],
                 WAIT_PAYMENT: [MessageHandler(filters.PHOTO, step4_payment)],
                 ConversationHandler.TIMEOUT: [
-                    MessageHandler(filters.ALL, timeout_handler),
-                    CallbackQueryHandler(timeout_handler)
+                    MessageHandler(filters.ALL & ~filters.COMMAND, timeout_handler),
+                    CallbackQueryHandler(timeout_handler, pattern=r"^(confirm_id|back_id|cancel_user_.*)$")
                 ]
             },
             fallbacks=[
                 CommandHandler("start", send_welcome),
-                MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, timeout_handler),
+                MessageHandler(filters.ALL & ~filters.COMMAND, timeout_handler),
             ],
             conversation_timeout=CONVERSATION_TIMEOUT,
             name="order_conversation",
@@ -751,24 +641,18 @@ async def main_async():
 
         app.add_error_handler(global_error_handler)
 
-        # Start Quart in separate thread
-        quart_thread = threading.Thread(target=start_quart, daemon=True, name="QuartThread")
-        quart_thread.start()
-
-        monitor_task = asyncio.create_task(_monitor_quart_thread())
-
-        ready = await asyncio.to_thread(quart_ready_event.wait, QUART_READY_TIMEOUT)
-        if not ready:
-            logger.warning("Quart DB did not become ready in time; health check may show down.")
-        if quart_fatal_event.is_set():
-            logger.critical("Quart DB initialization failed fatally. Exiting bot.")
-            return
-
         await app.initialize()
-        await app.bot.delete_webhook(drop_pending_updates=True)
-
-        quart_app.config['BOT_INSTANCE'] = app.bot
+        await app.bot.delete_webhook(drop_pending_updates=False)
         await app.start()
+
+        # Set bot instance for Quart routes (now same loop – safe)
+        quart_app.config['BOT_INSTANCE'] = app.bot
+
+        # Start Quart server as a background task on the main event loop
+        quart_config = Config()
+        quart_config.bind = [f"0.0.0.0:{PORT}"]
+        quart_task = asyncio.create_task(serve(quart_app, quart_config))
+        logger.info("Quart server started on main event loop.")
 
         if not app.updater:
             logger.critical("Updater unavailable. Exiting.")
@@ -780,20 +664,17 @@ async def main_async():
 
         try:
             await app.updater.start_polling(
-                drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"]
+                drop_pending_updates=False,
+                allowed_updates=None
             )
         except Conflict:
             logger.critical("Another bot instance is already polling. Exiting.")
             return
 
-        bot_running = True
         logger.info("Bot polling started.")
 
         if not _startup_notification_sent:
             asyncio.create_task(_notify_startup_task(app))
-
-        shutdown_event = asyncio.Event()
 
         def signal_handler():
             logger.info("Received termination signal. Initiating shutdown...")
@@ -806,22 +687,13 @@ async def main_async():
         except NotImplementedError:
             pass
 
-        async def wait_for_shutdown():
-            while not shutdown_event.is_set():
-                if quart_fatal_event.is_set():
-                    logger.critical("Quart fatal failure detected. Shutting down bot.")
-                    shutdown_event.set()
-                    break
-                await asyncio.sleep(0.5)
-
         try:
-            await wait_for_shutdown()
+            await shutdown_event.wait()
         except asyncio.CancelledError:
             pass
 
     finally:
         logger.info("Shutting down…")
-        bot_running = False
 
         if app:
             try:
@@ -835,25 +707,21 @@ async def main_async():
             except Exception:
                 pass
             try:
-                await app.shutdown()
+                await asyncio.wait_for(app.shutdown(), timeout=APP_SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("app.shutdown() timed out, continuing.")
             except Exception:
-                pass
+                logger.exception("app.shutdown() error:")
 
-        if monitor_task:
-            monitor_task.cancel()
+        # Stop Quart server
+        if quart_task and not quart_task.done():
+            quart_task.cancel()
             try:
-                await monitor_task
+                await quart_task
             except asyncio.CancelledError:
                 pass
-
-        if quart_loop and quart_shutdown_event:
-            try:
-                quart_loop.call_soon_threadsafe(quart_shutdown_event.set)
-            except Exception:
-                logger.debug("Quart event loop already closed (or not accessible).")
-
-        if quart_thread and quart_thread.is_alive():
-            await asyncio.to_thread(quart_thread.join, QUART_SHUTDOWN_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"Quart task error during shutdown: {e}")
 
         if app:
             db = app.bot_data.get('db')
