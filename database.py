@@ -1,4 +1,4 @@
-# database.py (Render‑free optimized final – Settings index fix)
+# database.py (Production-hardened with defensive logging + Users collection)
 import asyncio
 import logging
 import os
@@ -53,6 +53,7 @@ class LicenseCache:
         self._cleanup_interval = cleanup_interval
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self.MAX_CACHE_SIZE = 10000
 
     async def _cleanup_loop(self):
         while not self._stop_event.is_set():
@@ -102,7 +103,9 @@ class LicenseCache:
         async with self._lock:
             if key in self._cache:
                 data = self._cache[key]
-                if datetime.now(UTC_TZ) - data["cached_at"] < timedelta(seconds=data["ttl_seconds"]):
+                cached_at = data.get("cached_at")
+                ttl = data.get("ttl_seconds", 60)
+                if cached_at and (datetime.now(UTC_TZ) - cached_at) < timedelta(seconds=ttl):
                     return data
                 del self._cache[key]
             return None
@@ -110,6 +113,10 @@ class LicenseCache:
     async def set(self, user_id: int, valid: bool, expiry: Optional[datetime], ttl_seconds: int):
         key = str(user_id)
         async with self._lock:
+            # Prevent unbounded memory growth
+            if len(self._cache) >= self.MAX_CACHE_SIZE:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
             self._cache[key] = {
                 "valid": valid,
                 "expiry": expiry,
@@ -133,7 +140,7 @@ class PriceRepository:
         logger.info("Price indexes ensured.")
 
     async def add_or_update_price(self, diamond, item_type: str = "dia") -> bool:
-        diamond_str = _to_str(diamond)
+        diamond_str = _to_str(diamond).strip()
         if not diamond_str:
             return False
         diamond_int = _safe_int_or_log(diamond_str, "diamond")
@@ -166,7 +173,7 @@ class PriceRepository:
             return []
 
     async def get_price_by_amount(self, item_type: str, amount) -> Optional[dict]:
-        amount_str = _to_str(amount)
+        amount_str = _to_str(amount).strip()
         if not amount_str:
             return None
         try:
@@ -176,7 +183,7 @@ class PriceRepository:
             return None
 
     async def set_price_active(self, item_type: str, amount, is_active: bool):
-        amount_str = _to_str(amount)
+        amount_str = _to_str(amount).strip()
         if not amount_str:
             return
         await self.col.update_one(
@@ -185,24 +192,25 @@ class PriceRepository:
         )
 
     async def get_price_msg_id(self, item_type: str, amount) -> Optional[int]:
-        amount_str = _to_str(amount)
+        amount_str = _to_str(amount).strip()
         if not amount_str:
             return None
         doc = await self.col.find_one({"type": item_type, "diamond": amount_str}, {"msg_id": 1, "_id": 0})
         return doc.get("msg_id") if doc else None
 
     async def set_price_msg_id(self, item_type: str, amount, msg_id: int):
-        amount_str = _to_str(amount)
+        amount_str = _to_str(amount).strip()
         if not amount_str:
             return
-        await self.col.update_one(
+        result = await self.col.update_one(
             {"type": item_type, "diamond": amount_str},
-            {"$set": {"msg_id": msg_id}},
-            upsert=True
+            {"$set": {"msg_id": msg_id}}
         )
+        if result.matched_count == 0:
+            logger.warning(f"set_price_msg_id: no price doc for {item_type}/{amount_str}")
 
     async def increment_monthly_count(self, quantity, item_type: str = "dia"):
-        quantity_str = _to_str(quantity)
+        quantity_str = _to_str(quantity).strip()
         if not quantity_str:
             return
         result = await self.col.update_one(
@@ -214,7 +222,7 @@ class PriceRepository:
 
     async def get_all_with_monthly_counts(self) -> List[dict]:
         cursor = self.col.find({"monthly_count": {"$gt": 0}}).sort("diamond_int", 1)
-        return await cursor.to_list(length=None)
+        return await cursor.to_list(length=500)
 
     async def reset_monthly_counts_bulk(self, items: List[Tuple[str, str]]):
         if not items:
@@ -267,8 +275,7 @@ class OrderRepository:
         await self.col.create_index("order_id", unique=True, background=True)
         await self.col.create_index("user_id", background=True)
         await self.col.create_index([("status", 1), ("expire_at", 1)], background=True)
-        # ❌ TTL index ဖြုတ်ထားပြီ (manual timeout only)
-        logger.info("Order indexes ensured (NO TTL – manual timeout processing).")
+        logger.info("Order indexes ensured.")
 
     async def create_order(self, order_id: str, user_id, profile_name: str,
                            dia, price_snapshot, item_type: str,
@@ -402,23 +409,22 @@ class LicenseRepository:
         self.master_url = master_api_url
         self.secret = secret_token
         self.client_mode = is_client_mode
-        # Lazy session pattern for Render free safety
         self._session = http_session
-        self._own_session = False   # True if we created it ourselves later
+        self._own_session = False
         self._pending: Dict[int, asyncio.Task] = {}
         self._pending_lock = asyncio.Lock()
 
     async def _ensure_session(self):
-        if self._session is None:
+        if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
             self._own_session = True
-            logger.debug("Created internal aiohttp session for license checks.")
+            logger.debug("Created new internal aiohttp session.")
 
     async def _check_local(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
         try:
             doc = await self.col.find_one({"user_id": user_id})
         except Exception as e:
-            logger.error(f"DB error checking license for {user_id}: {e}")
+            logger.exception(f"DB error checking license for {user_id}")
             return False, None
         if not doc:
             return False, None
@@ -427,22 +433,22 @@ class LicenseRepository:
             return False, None
         return expiry > datetime.now(UTC_TZ), expiry
 
+    async def check_license_local(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
+        return await self._check_local(user_id)
+
     async def _fetch_from_master(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
         if not self.master_url:
             raise ValueError("MASTER_API_URL not set")
         await self._ensure_session()
         url = f"{self.master_url.rstrip('/')}/api/license/check/{user_id}"
         timeout = aiohttp.ClientTimeout(total=10)
-        try:
-            async with self._session.get(url, timeout=timeout,
-                                         headers={"Authorization": f"Bearer {self.secret}"}) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise Exception(f"Master API returned {resp.status}: {text}")
-                data = await resp.json()
-                return data.get("valid", False), _ensure_utc(data.get("expiry"))
-        except Exception:
-            raise
+        async with self._session.get(url, timeout=timeout,
+                                     headers={"Authorization": f"Bearer {self.secret}"}) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise Exception(f"Master API returned {resp.status}: {text}")
+            data = await resp.json()
+            return data.get("valid", False), _ensure_utc(data.get("expiry"))
 
     async def _fetch_fresh(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
         if self.client_mode:
@@ -485,11 +491,22 @@ class LicenseRepository:
             else:
                 try:
                     task = asyncio.create_task(self._fetch_and_cache(user_id))
+                    def _safe_cleanup(uid):
+                        async def _clean():
+                            async with self._pending_lock:
+                                self._pending.pop(uid, None)
+                        asyncio.create_task(_clean())
+                    task.add_done_callback(lambda _: _safe_cleanup(user_id))
                     self._pending[user_id] = task
                 except Exception:
-                    logger.error(f"Failed to create fetch task for {user_id}")
+                    logger.exception(f"Failed to create fetch task for {user_id}")
                     return False
-        return await task
+
+        try:
+            return await task
+        except Exception as e:
+            logger.exception(f"License task failed for {user_id}")
+            return False
 
     async def _fetch_and_cache(self, user_id: int) -> bool:
         try:
@@ -498,7 +515,7 @@ class LicenseRepository:
             await self.cache.set(user_id, valid, expiry, ttl)
             return valid
         except Exception as e:
-            logger.error(f"Fresh license fetch failed for {user_id}: {e}")
+            logger.exception(f"Fresh license fetch failed for {user_id}")
             cached = await self.cache.get(user_id)
             if cached and cached.get("expiry") and cached["expiry"] > datetime.now(UTC_TZ):
                 return True
@@ -550,7 +567,7 @@ class LicenseRepository:
             logger.info(f"License updated for {user_id}: +{months} month(s)")
             return True
         except Exception as e:
-            logger.error(f"Error updating license for {user_id}: {e}")
+            logger.exception(f"Error updating license for {user_id}")
             raise
 
     async def get_all_licenses(self):
@@ -559,10 +576,17 @@ class LicenseRepository:
 
     async def cleanup_expired(self) -> int:
         now = datetime.now(UTC_TZ)
-        res = await self.col.delete_many({"expiry_date": {"$lt": now}})
+        expired_ids = []
+        cursor = self.col.find({"expiry_date": {"$lt": now}}, {"user_id": 1})
+        async for doc in cursor:
+            expired_ids.append(doc["user_id"])
+        if not expired_ids:
+            return 0
+        res = await self.col.delete_many({"user_id": {"$in": expired_ids}})
         deleted = res.deleted_count
-        if deleted:
-            logger.info(f"Cleaned up {deleted} expired licenses")
+        for uid in expired_ids:
+            await self.cache.invalidate(uid)
+        logger.info(f"Cleaned up {deleted} expired licenses")
         return deleted
 
     async def revoke_license(self, user_id: int) -> bool:
@@ -575,7 +599,7 @@ class LicenseRepository:
             logger.info(f"License revoked for {user_id}")
             return True
         except Exception as e:
-            logger.error(f"Error revoking license for {user_id}: {e}")
+            logger.exception(f"Error revoking license for {user_id}")
             return False
 
     async def close(self):
@@ -615,7 +639,7 @@ class BannedUserRepository:
             self.banned_set.add(user_id)
             return True
         except Exception as e:
-            logger.error(f"Error banning {user_id}: {e}")
+            logger.exception(f"Error banning {user_id}")
             return False
 
     async def unban(self, user_id: int) -> bool:
@@ -627,7 +651,7 @@ class BannedUserRepository:
             self.banned_set.discard(user_id)
             return res.deleted_count > 0
         except Exception as e:
-            logger.error(f"Error unbanning {user_id}: {e}")
+            logger.exception(f"Error unbanning {user_id}")
             return False
 
     async def is_banned(self, user_id: int) -> bool:
@@ -642,12 +666,10 @@ class SettingsRepository:
         self.col = col
 
     async def setup_indexes(self):
-        # 🔧 ပြင်ဆင်ချက် - null config_key ဟောင်းများကို ဖျက်ပြီး sparse index ဆောက်ခြင်း
         try:
             await self.col.delete_many({"config_key": None})
         except Exception as e:
             logger.warning(f"Failed to clean null config_key documents: {e}")
-
         await self.col.create_index("config_key", unique=True, sparse=True, background=True)
         await self.col.create_index("setting_type", background=True)
         logger.info("Settings indexes ensured (sparse unique on config_key).")
@@ -686,7 +708,7 @@ class SettingsRepository:
             )
             return True
         except Exception as e:
-            logger.error(f"Error setting bot info: {e}")
+            logger.exception("Error setting bot info")
             return False
 
     async def get_bot_info(self) -> dict:
@@ -715,6 +737,32 @@ class MonthlyReportRepository:
         return res.deleted_count
 
 
+class UsersRepository:
+    """Lightweight user store for broadcast (Render‑friendly)."""
+    def __init__(self, col):
+        self.col = col
+
+    async def setup_indexes(self):
+        await self.col.create_index("user_id", unique=True, background=True)
+
+    async def upsert_user(self, user_id: int):
+        try:
+            await self.col.update_one(
+                {"user_id": user_id},
+                {"$set": {"user_id": user_id}},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to upsert user {user_id}: {e}")
+
+    async def get_all_user_ids(self, limit: int = 10000) -> List[int]:
+        cursor = self.col.find({}, {"user_id": 1, "_id": 0}).limit(limit)
+        ids = []
+        async for doc in cursor:
+            ids.append(doc["user_id"])
+        return ids
+
+
 class DatabaseManager:
     def __init__(self, uri: str, db_name: str = "DiamondBotDB",
                  http_session: Optional[aiohttp.ClientSession] = None,
@@ -728,8 +776,8 @@ class DatabaseManager:
             socketTimeoutMS=20000,
             retryWrites=True,
             retryReads=True,
-            maxPoolSize=20,
-            minPoolSize=1,
+            maxPoolSize=10,
+            minPoolSize=0,
             waitQueueTimeoutMS=5000,
             maxIdleTimeMS=60000,
         )
@@ -749,6 +797,7 @@ class DatabaseManager:
         self.banned_repo     = BannedUserRepository(self.db['BannedUsers'], self._banned_set)
         self.settings_repo   = SettingsRepository(self.db['Settings'])
         self.report_repo     = MonthlyReportRepository(self.db['Monthly_Reports'])
+        self.users_repo      = UsersRepository(self.db['Users'])          # 🆕 lightweight user collection
 
         self._cache_cleanup_started = False
 
@@ -767,29 +816,35 @@ class DatabaseManager:
     @property
     def nickname_cache(self): return self.db['nickname_cache']
     @property
+    def users(self): return self.db['Users']                             # 🆕 convenience property
+    @property
     def primary_admin_id(self): return self._primary_admin_id
 
     def is_super_admin(self, user_id: int) -> bool:
         return self._primary_admin_id is not None and user_id == self._primary_admin_id
 
     async def setup_indexes(self):
-        await self.price_repo.setup_indexes()
-        await self.order_repo.setup_indexes()
-        await self.license_repo.col.create_index("user_id", unique=True, background=True)
-        await self.report_repo.setup_indexes()
-        await self.banned_repo.setup_indexes()
-        await self.settings_repo.setup_indexes()
-        await self.db['nickname_cache'].create_index(
-            "timestamp", expireAfterSeconds=86400, background=True
-        )
-        logger.info("✅ All indexes verified/created.")
+        try:
+            await self.price_repo.setup_indexes()
+            await self.order_repo.setup_indexes()
+            await self.license_repo.col.create_index("user_id", unique=True, background=True)
+            await self.report_repo.setup_indexes()
+            await self.banned_repo.setup_indexes()
+            await self.settings_repo.setup_indexes()
+            await self.users_repo.setup_indexes()                        # 🆕 ensure user index
+            await self.db['nickname_cache'].create_index(
+                "timestamp", expireAfterSeconds=86400, background=True
+            )
+            logger.info("✅ All indexes verified/created.")
+        except Exception as e:
+            logger.exception("❌ Failed to setup some indexes, continuing anyway.")
 
     async def ping(self) -> bool:
         try:
             await self.client.admin.command('ping')
             return True
         except Exception as e:
-            logger.error(f"❌ MongoDB ping failed: {e}")
+            logger.exception("❌ MongoDB ping failed")
             return False
 
     def start_cache_cleanup(self):
@@ -805,19 +860,20 @@ class DatabaseManager:
 
     async def generate_monthly_report(self, year_month: str) -> dict:
         report_data = await self.order_repo.generate_monthly_report_data(year_month)
-
-        # No transaction – simple bulk reset on Render free
         prices = await self.price_repo.get_all_with_monthly_counts()
         items_sold = []
         items_to_reset = []
         for p in prices:
             item_type_str = "Dia" if p.get("type", "dia") == "dia" else "UC"
-            items_sold.append(f"{p['diamond']} {item_type_str} ({p['monthly_count']})")
-            items_to_reset.append((p["type"], p["diamond"]))
-
+            diamond = p.get("diamond", "?")
+            count = p.get("monthly_count", 0)
+            items_sold.append(f"{diamond} {item_type_str} ({count})")
+            ptype = p.get("type")
+            pdiamond = p.get("diamond")
+            if ptype and pdiamond:
+                items_to_reset.append((ptype, pdiamond))
         if items_to_reset:
             await self.price_repo.reset_monthly_counts_bulk(items_to_reset)
-
         items_sold_str = ", ".join(items_sold) if items_sold else "အရောင်းမရှိပါ"
         report = {"Total Orders": report_data["total_orders"], "Items Sold": items_sold_str}
         await self.report_repo.upsert_report(year_month, report)
