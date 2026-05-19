@@ -15,7 +15,6 @@ import pytz
 import aiohttp
 from quart import Quart, jsonify, request
 from telegram import Update
-from telegram.constants import UpdateType
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -152,7 +151,7 @@ def role_required(role: str = "admin"):
             user_id = update.effective_user.id
             allowed = master.is_master(user_id) if role == "master" else master.is_admin(user_id)
             if not allowed:
-                msg = "⛔ Master အခွင့်အရေး လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
+                msg = "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
                 if update.message:
                     await update.message.reply_text(msg)
                 elif update.callback_query:
@@ -551,9 +550,10 @@ async def master_license_add_command(update: Update, context: ContextTypes.DEFAU
 app = None
 
 async def main_async():
-    global app
+    global app, _startup_lock, _startup_notification_sent
 
     _startup_lock = asyncio.Lock()
+    _startup_notification_sent = False
 
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
