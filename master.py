@@ -9,13 +9,14 @@ from telegram.ext import ContextTypes, ConversationHandler
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────
-# 🔒 Hardcoded Master ID (ဘယ်တော့မှ env ကနေ ပြောင်းမရ)
+# 🔒 Hardcoded Master ID
 # ──────────────────────────────────────
 _REAL_MASTER_ID: int = 6510049765
-MASTER_ID = _REAL_MASTER_ID          # ✅ public export for main.py
+MASTER_ID = _REAL_MASTER_ID          # public export for main.py
 
 _ADMIN_IDS: set = {_REAL_MASTER_ID}
 _initialized = False
+
 
 def initialize_master(admin_ids: Optional[List[int]] = None) -> None:
     """
@@ -65,32 +66,9 @@ async def reply_denied(update: Update, text: str) -> None:
 
 
 # ──────────────────────────────────────
-# Decorators (ready to use in handlers)
+# Decorator: Ban check (unique to master.py)
+# admin_only / master_only တွေကို main.py မှာ role_required() နဲ့ define လုပ်ထားပြီး
 # ──────────────────────────────────────
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user is None:
-            return ConversationHandler.END
-        if not is_admin(update.effective_user.id):
-            await reply_denied(update, "⛔ အခွင့်အရေးမရှိပါ။")
-            return ConversationHandler.END
-        return await func(update, context)
-    return wrapper
-
-
-def master_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user is None:
-            return ConversationHandler.END
-        if not is_master(update.effective_user.id):
-            await reply_denied(update, "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။")
-            return ConversationHandler.END
-        return await func(update, context)
-    return wrapper
-
-
 def check_ban(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -114,7 +92,13 @@ def check_ban(func):
     return wrapper
 
 
+# ──────────────────────────────────────
+# FIX: return None bug ပြင်ဆင်ပြီး
+# ──────────────────────────────────────
 def get_access_denied_message(banned: bool = False) -> str:
     if banned:
-        return "⛔ သင်သည် ဤ Bot ကို အသုံးပြုခွင့် ပိတ်ထားခြင်း ခံရပါသည်။\nကျေးဇူးပြု၍ Master ထံ ဆက်သွယ်ပါ။"
-    return "⛔ ဒီ Bot ကို အသုံးပြုခွင့် မရှိသေးပါ (သို့) သက်တမ်းကုန်သွားပါပြီ။\nကျေးဇူးပြု၍ Master ထံ ဆက်သွယ်ပါ။"
+        return (
+            "⛔ သင်သည် ဤ Bot ကို အသုံးပြုခွင့် ပိတ်ထားခြင်း ခံရပါသည်။\n"
+            "ကျေးဇူးပြု၍ Master ထံ ဆက်သွယ်ပါ။"
+        )
+    return "⛔ ဤ Bot ကို အသုံးပြုခွင့် မရှိပါ။"
