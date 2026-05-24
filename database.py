@@ -47,6 +47,7 @@ def _ensure_utc(dt):
 
 
 class LicenseCache:
+    # (ဤအပိုင်း မပြောင်းလဲပါ - လိုအပ်ပါက မူလအတိုင်းထားပါ)
     def __init__(self, cleanup_interval: int = 3600):
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -113,7 +114,6 @@ class LicenseCache:
     async def set(self, user_id: int, valid: bool, expiry: Optional[datetime], ttl_seconds: int):
         key = str(user_id)
         async with self._lock:
-            # Prevent unbounded memory growth
             if len(self._cache) >= self.MAX_CACHE_SIZE:
                 oldest_key = next(iter(self._cache))
                 del self._cache[oldest_key]
@@ -131,6 +131,7 @@ class LicenseCache:
 
 
 class PriceRepository:
+    # (မပြောင်းလဲပါ)
     def __init__(self, col):
         self.col = col
 
@@ -268,6 +269,7 @@ class PriceRepository:
 
 
 class OrderRepository:
+    # (မပြောင်းလဲပါ)
     def __init__(self, col):
         self.col = col
 
@@ -401,6 +403,7 @@ class OrderRepository:
 
 
 class LicenseRepository:
+    # (ဤအပိုင်းတွင် add_or_update ကိုသာ ပြင်ဆင်ထားပါသည်)
     def __init__(self, col, cache: LicenseCache,
                  http_session: Optional[aiohttp.ClientSession],
                  master_api_url: str, secret_token: str, is_client_mode: bool):
@@ -568,7 +571,8 @@ class LicenseRepository:
             return True
         except Exception as e:
             logger.exception(f"Error updating license for {user_id}")
-            raise
+            # 🛠 FIX: raise မလုပ်တော့ဘဲ return False ပြန်ပါ
+            return False
 
     async def get_all_licenses(self):
         cursor = self.col.find({}).limit(1000)
@@ -610,6 +614,7 @@ class LicenseRepository:
 
 
 class BannedUserRepository:
+    # (မပြောင်းလဲပါ)
     def __init__(self, col, banned_set: Set[int]):
         self.col = col
         self.banned_set = banned_set
@@ -662,6 +667,7 @@ class BannedUserRepository:
 
 
 class SettingsRepository:
+    # (မပြောင်းလဲပါ)
     def __init__(self, col):
         self.col = col
 
@@ -719,6 +725,7 @@ class SettingsRepository:
 
 
 class MonthlyReportRepository:
+    # (မပြောင်းလဲပါ)
     def __init__(self, col):
         self.col = col
 
@@ -739,17 +746,24 @@ class MonthlyReportRepository:
 
 class UsersRepository:
     """Lightweight user store for broadcast (Render‑friendly)."""
+
     def __init__(self, col):
         self.col = col
 
     async def setup_indexes(self):
+        # 🛠 FIX: user_id အပြင် last_seen အတွက် index ထည့်ပါ
         await self.col.create_index("user_id", unique=True, background=True)
+        await self.col.create_index("last_seen", background=True)
 
     async def upsert_user(self, user_id: int):
+        # 🛠 FIX: last_seen timestamp ထည့်ပါ
         try:
             await self.col.update_one(
                 {"user_id": user_id},
-                {"$set": {"user_id": user_id}},
+                {"$set": {
+                    "user_id": user_id,
+                    "last_seen": datetime.now(UTC_TZ)
+                }},
                 upsert=True
             )
         except Exception as e:
@@ -761,6 +775,22 @@ class UsersRepository:
         async for doc in cursor:
             ids.append(doc["user_id"])
         return ids
+
+    # 🛠 FIX: method အသစ် – Ban မဟုတ်သောသူများ ရေတွက်
+    async def get_active_user_count(self, banned_set: set) -> int:
+        try:
+            query = {"user_id": {"$nin": list(banned_set)}} if banned_set else {}
+            return await self.col.count_documents(query)
+        except Exception as e:
+            logger.error(f"get_active_user_count failed: {e}")
+            return 0
+
+    # 🛠 FIX: method အသစ် – Blocked user ဖယ်ရှား
+    async def remove_user(self, user_id: int):
+        try:
+            await self.col.delete_one({"user_id": user_id})
+        except Exception as e:
+            logger.error(f"remove_user {user_id} failed: {e}")
 
 
 class DatabaseManager:
@@ -797,7 +827,7 @@ class DatabaseManager:
         self.banned_repo     = BannedUserRepository(self.db['BannedUsers'], self._banned_set)
         self.settings_repo   = SettingsRepository(self.db['Settings'])
         self.report_repo     = MonthlyReportRepository(self.db['Monthly_Reports'])
-        self.users_repo      = UsersRepository(self.db['Users'])          # 🆕 lightweight user collection
+        self.users_repo      = UsersRepository(self.db['Users'])
 
         self._cache_cleanup_started = False
 
@@ -816,7 +846,7 @@ class DatabaseManager:
     @property
     def nickname_cache(self): return self.db['nickname_cache']
     @property
-    def users(self): return self.db['Users']                             # 🆕 convenience property
+    def users(self): return self.db['Users']
     @property
     def primary_admin_id(self): return self._primary_admin_id
 
@@ -831,7 +861,7 @@ class DatabaseManager:
             await self.report_repo.setup_indexes()
             await self.banned_repo.setup_indexes()
             await self.settings_repo.setup_indexes()
-            await self.users_repo.setup_indexes()                        # 🆕 ensure user index
+            await self.users_repo.setup_indexes()
             await self.db['nickname_cache'].create_index(
                 "timestamp", expireAfterSeconds=86400, background=True
             )
