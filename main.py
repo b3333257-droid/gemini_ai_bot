@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 import master
-from master import MASTER_ID
+from master import MASTER_ID, check_ban          # 🛠 FIX: check_ban import
 from database import DatabaseManager, UTC_TZ, _ensure_utc
 import handlers
 from handlers import (
@@ -151,7 +151,7 @@ def role_required(role: str = "admin"):
             user_id = update.effective_user.id
             allowed = master.is_master(user_id) if role == "master" else master.is_admin(user_id)
             if not allowed:
-                msg = "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
+                msg = "⛔ Master အခွင့်အရေး လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
                 if update.message:
                     await update.message.reply_text(msg)
                 elif update.callback_query:
@@ -233,7 +233,6 @@ async def _safe_job(func, context, name: str):
 async def setup_jobs(application):
     jq = application.job_queue
     if not jq:
-        # This will be caught by the fail-fast check earlier, but keep as safety
         logger.critical("❌ PTB JobQueue not available! Install python-telegram-bot[job-queue]")
         return
 
@@ -307,7 +306,7 @@ async def purge_old_data_job(context):
 # Startup Notifications
 # ──────────────────────────────────────
 _startup_notification_sent = False
-_startup_lock = None
+_startup_lock = asyncio.Lock()          # 🛠 FIX: module‑level Lock
 
 async def _notify_startup_task(app):
     global _startup_notification_sent, _startup_lock
@@ -495,11 +494,8 @@ async def api_license_check(user_id: int):
         if not secrets.compare_digest(token, API_SECRET_TOKEN):
             return jsonify({"error": "Unauthorized"}), 401
 
-        # Rate limiting (simple in-memory, per IP)
         ip = get_client_ip(request)
-        # (keeping basic rate limit if needed; optional, can be removed)
-        # In production, consider using a proper store; here we keep a minimal dict.
-        # Not a separate loop issue now.
+        # (simple rate limiting can be added here if needed)
         valid, expiry = await db.license_repo.check_license_local(user_id)
         if valid:
             return jsonify({"valid": True, "expiry": expiry.isoformat() if expiry else None}), 200
@@ -552,7 +548,7 @@ app = None
 async def main_async():
     global app, _startup_lock, _startup_notification_sent
 
-    _startup_lock = asyncio.Lock()
+    _startup_lock = asyncio.Lock()      # already global, but safe
     _startup_notification_sent = False
 
     app = (ApplicationBuilder()
@@ -565,7 +561,6 @@ async def main_async():
            .build()
     )
 
-    # ✅ Fail-fast if job-queue extra is missing
     if not app.job_queue:
         raise RuntimeError(
             "PTB JobQueue is not available. Install python-telegram-bot[job-queue] or ensure the extra is present."
@@ -579,7 +574,6 @@ async def main_async():
             logger.critical("Database initialization failed. Exiting.")
             return
 
-        # Store db in Quart config so routes can access it
         db = app.bot_data['db']
         quart_app.config['DB'] = db
         quart_app.config['ADMIN_ID'] = PRIMARY_ADMIN_ID
@@ -608,12 +602,13 @@ async def main_async():
         app.add_handler(CommandHandler("paid", master_paid_command))
         app.add_handler(CommandHandler("license", master_license_add_command))
 
+        # 🛠 FIX: Apply check_ban to user‑facing entry points
         conv_handler = ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(step1_selection, pattern=r"^price_(dia|uc)_.+$"),
-                CallbackQueryHandler(show_items, pattern=r"^(show_dia|show_uc)$"),
-                CallbackQueryHandler(send_welcome, pattern=r"^back_to_main$"),
-                CommandHandler("start", send_welcome),
+                CallbackQueryHandler(check_ban(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
+                CallbackQueryHandler(check_ban(show_items), pattern=r"^(show_dia|show_uc)$"),
+                CallbackQueryHandler(check_ban(send_welcome), pattern=r"^back_to_main$"),
+                CommandHandler("start", check_ban(send_welcome)),
             ],
             states={
                 WAIT_GAME_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, step2_id_entry)],
@@ -625,7 +620,7 @@ async def main_async():
                 ]
             },
             fallbacks=[
-                CommandHandler("start", send_welcome),
+                CommandHandler("start", check_ban(send_welcome)),
                 MessageHandler(filters.ALL & ~filters.COMMAND, timeout_handler),
             ],
             conversation_timeout=CONVERSATION_TIMEOUT,
@@ -645,10 +640,8 @@ async def main_async():
         await app.bot.delete_webhook(drop_pending_updates=False)
         await app.start()
 
-        # Set bot instance for Quart routes (now same loop – safe)
         quart_app.config['BOT_INSTANCE'] = app.bot
 
-        # Start Quart server as a background task on the main event loop
         quart_config = Config()
         quart_config.bind = [f"0.0.0.0:{PORT}"]
         quart_task = asyncio.create_task(serve(quart_app, quart_config))
@@ -713,7 +706,6 @@ async def main_async():
             except Exception:
                 logger.exception("app.shutdown() error:")
 
-        # Stop Quart server
         if quart_task and not quart_task.done():
             quart_task.cancel()
             try:
