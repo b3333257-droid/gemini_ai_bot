@@ -8,7 +8,7 @@ import hashlib
 import time as _time
 from urllib.parse import quote
 from datetime import datetime, date, timedelta, timezone
-from enum import Enum
+from enum import Enum, IntEnum
 from functools import wraps
 
 import aiohttp
@@ -29,6 +29,14 @@ ADMIN_PARSE_MODE = ParseMode.HTML
 DIA_ID_RE = re.compile(r"^(\d{5,20})[\s\-()]+(\d{3,6})\)?$")
 UC_ID_RE = re.compile(r"^(\d{5,20})$")
 SET_PRICE_RE = re.compile(r"/set(dia|uc)\s+(.+)", re.IGNORECASE)
+
+# Broadcast concurrency helpers
+_broadcast_lock = asyncio.Lock()
+
+class _SR(IntEnum):
+    SUCCESS = 0
+    FAILED  = 1
+    BLOCKED = 2
 
 class OrderStatus(str, Enum):
     PENDING_ID = "pending_id"
@@ -395,9 +403,10 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.answer(text, show_alert=True)
         return ConversationHandler.END
 
+    # ── ရိုးရိုး ဝယ်ယူခလုတ်များ → primary (အပြာ) ──
     keyboard = [[
-        InlineKeyboardButton("💎 စိန်ဝယ်ယူရန်", callback_data="show_dia"),
-        InlineKeyboardButton("💵 UCဝယ်ယူရန်", callback_data="show_uc")
+        InlineKeyboardButton("💎 စိန်ဝယ်ယူရန်", callback_data="show_dia", style="primary"),
+        InlineKeyboardButton("💵 UCဝယ်ယူရန်", callback_data="show_uc", style="primary")
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -443,19 +452,21 @@ async def show_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = p.get('amount') or p.get('diamond')
         btn_text = str(amount).strip()
         cb_data = f"price_{item_type}_{_price_hash(btn_text)}"
+        # ── ဈေးနှုန်းခလုတ်များ → primary (အပြာ) ──
         if len(btn_text) > 18:
             if row:
                 keyboard.append(row)
                 row = []
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb_data)])
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=cb_data, style="primary")])
         else:
-            row.append(InlineKeyboardButton(btn_text, callback_data=cb_data))
+            row.append(InlineKeyboardButton(btn_text, callback_data=cb_data, style="primary"))
             if len(row) == 3:
                 keyboard.append(row)
                 row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_main")])
+    # ── နောက်သို့ခလုတ် → primary (အပြာ) ──
+    keyboard.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="back_to_main", style="primary")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     msg_id_key = "dia_msg_id" if item_type == "dia" else "uc_msg_id"
@@ -584,8 +595,10 @@ async def step2_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ အတည်ပြုမယ်", callback_data="confirm_id"),
-            InlineKeyboardButton("✏️ ID ပြန်ပြင်မယ်", callback_data="back_id")
+            # ── အတည်ပြုခလုတ် → success (အစိမ်း) ──
+            InlineKeyboardButton("✅ အတည်ပြုမယ်", callback_data="confirm_id", style="success"),
+            # ── ID ပြန်ပြင်ခလုတ် → primary (အပြာ) ──
+            InlineKeyboardButton("✏️ ID ပြန်ပြင်မယ်", callback_data="back_id", style="primary")
         ]])
     )
     return WAIT_CONFIRMATION
@@ -618,8 +631,9 @@ async def step3_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"$set": {"order_info.region": region}}
         )
         payment_msg_id = await db.price_repo.get_price_msg_id(item_type, quantity)
+        # ── မဝယ်တော့ပါ → danger (အနီ) ──
         reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ မဝယ်တော့ပါ", callback_data=f"cancel_user_{order_id}")
+            InlineKeyboardButton("❌ မဝယ်တော့ပါ", callback_data=f"cancel_user_{order_id}", style="danger")
         ]])
         if payment_msg_id:
             try:
@@ -679,9 +693,10 @@ async def step4_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item = context.user_data.get('item_type', 'dia')
 
     caption = build_caption_from_order(order, "စစ်ဆေးရန်...", user.first_name, user.last_name)
+    # ── Admin ခလုတ်များ: လက်ခံ → success (အစိမ်း) | ငြင်းပယ် → danger (အနီ) ──
     admin_markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ လက်ခံမယ်", callback_data=f"admin_approve_{order_id}"),
-        InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data=f"admin_reject_{order_id}")
+        InlineKeyboardButton("✅ လက်ခံမယ်", callback_data=f"admin_approve_{order_id}", style="success"),
+        InlineKeyboardButton("❌ ငြင်းပယ်မယ်", callback_data=f"admin_reject_{order_id}", style="danger")
     ]])
 
     @retry_on_telegram_error(max_retries=3)
@@ -778,8 +793,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                                        text="✅ Admin မှ ငွေလွှဲမှုကို အတည်ပြုလိုက်ပါပြီ။ ခေတ္တစောင့်ပါ။")
         caption = build_caption_from_order(order, "⏳ Approved - Waiting for completion",
                                            first_name, last_name)
+        # ── ထည့်ပြီးပြီ → success (အစိမ်း) ──
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💎 ထည့်ပြီးပြီ", callback_data=f"admin_complete_{order_id}")
+            InlineKeyboardButton("💎 ထည့်ပြီးပြီ", callback_data=f"admin_complete_{order_id}", style="success")
         ]])
         await edit_admin_message(query, caption, markup)
 
@@ -795,10 +811,11 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("⚠️ အော်ဒါကို ပြီးဆုံးကြောင်း မှတ်သားပြီးဖြစ်နိုင်ပါသည်။", show_alert=True)
             return
 
+        # ── နောက်ထပ်ဝယ်ယူရန် → primary (အပြာ) ──
         await context.bot.send_message(chat_id=user_customer,
                                        text="✅ သင်ဝယ်ထားသော Item ကို အောင်မြင်စွာ ထည့်ပေးပြီးပါပြီ။",
                                        reply_markup=InlineKeyboardMarkup([[
-                                           InlineKeyboardButton("🔄 နောက်ထပ် ဝယ်ယူရန်", callback_data="new_order")
+                                           InlineKeyboardButton("🔄 နောက်ထပ် ဝယ်ယူရန်", callback_data="new_order", style="primary")
                                        ]]))
         caption = build_caption_from_order(order, "✅ Completed", first_name, last_name)
         await edit_admin_message(query, caption, reply_markup=None)
@@ -816,8 +833,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("⚠️ အော်ဒါကို ငြင်းပယ်ပြီးဖြစ်နိုင်ပါသည်။", show_alert=True)
             return
 
+        # ── Owner ဆက်သွယ်ရန် → primary (အပြာ) ──
         support_btn = InlineKeyboardMarkup([[
-            InlineKeyboardButton("ownerထံ ဆက်သွယ်ရန်", url=f"tg://user?id={admin_id}")
+            InlineKeyboardButton("ownerထံ ဆက်သွယ်ရန်", url=f"tg://user?id={admin_id}", style="primary")
         ]])
         try:
             await context.bot.send_message(chat_id=user_customer,
@@ -931,6 +949,9 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⛔ အခွင့်အရေးမရှိပါ။")
 
+# ═══════════════════════════════════════
+# 🛠 FIXED: post_command with concurrent broadcast + auto-cleanup
+# ═══════════════════════════════════════
 @handle_errors
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
@@ -942,38 +963,97 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ပို့ချင်သော Message ကို Reply လုပ်ပြီး /post ကိုသုံးပါ။")
         return
 
-    await update.message.reply_text("⏳ သုံးစွဲသူများထံ စတင်ပို့နေပါသည်...")
-
-    try:
-        user_ids = await db.users_repo.get_all_user_ids()
-    except Exception as e:
-        logger.error(f"Failed to fetch user list: {e}")
-        await update.message.reply_text("⚠️ User list မရယူနိုင်ပါ။")
+    # Double-trigger guard – do not start if another broadcast is running
+    if _broadcast_lock.locked():
+        await update.message.reply_text("⏳ ယခင် Broadcast မပြီးဆုံးသေးပါ။")
         return
 
-    batch_size = 10
-    success = 0
-    total = len(user_ids)
-    failed = 0
+    async with _broadcast_lock:
+        status_msg = await update.message.reply_text("⏳ User list ရယူနေပါသည်...")
+        try:
+            user_ids = await db.users_repo.get_all_user_ids()
+            if not user_ids:
+                await status_msg.edit_text("⚠️ ပို့ရမည့် User မရှိပါ။")
+                return
 
-    for i in range(0, total, batch_size):
-        batch = user_ids[i:i+batch_size]
-        for uid in batch:
-            try:
-                await context.bot.copy_message(
-                    chat_id=uid,
-                    from_chat_id=update.message.chat_id,
-                    message_id=update.message.reply_to_message.message_id
+            total      = len(user_ids)
+            success    = 0
+            failed     = 0
+            blocked    = 0
+            blocked_ids: list[int] = []
+
+            from_chat      = update.message.chat_id
+            msg_id         = update.message.reply_to_message.message_id
+            BATCH          = 20
+            BATCH_DELAY    = 1.0
+            PROGRESS_EVERY = 100
+
+            async def send_one(uid: int) -> _SR:
+                try:
+                    await context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=from_chat,
+                        message_id=msg_id
+                    )
+                    return _SR.SUCCESS
+                except TelegramError as e:
+                    err = str(e).lower()
+                    if any(x in err for x in (
+                        "blocked", "deactivated", "not found", "chat not found"
+                    )):
+                        blocked_ids.append(uid)   # await မပါ – safe
+                        return _SR.BLOCKED
+                    return _SR.FAILED
+                except Exception:
+                    return _SR.FAILED
+
+            for i in range(0, total, BATCH):
+                batch   = user_ids[i : i + BATCH]
+                results = await asyncio.gather(*[send_one(uid) for uid in batch])
+
+                success += results.count(_SR.SUCCESS)
+                failed  += results.count(_SR.FAILED)
+                blocked += results.count(_SR.BLOCKED)
+
+                done = i + len(batch)
+                if done % PROGRESS_EVERY < BATCH or done >= total:
+                    try:
+                        await status_msg.edit_text(
+                            f"📡 ပို့နေပါသည်… {done}/{total}\n"
+                            f"✅ {success}  ❌ {failed}  🚫 {blocked} (blocked)"
+                        )
+                    except Exception:
+                        pass
+
+                if i + BATCH < total:
+                    await asyncio.sleep(BATCH_DELAY)
+
+            # Auto-remove blocked users from Users collection
+            if blocked_ids:
+                await asyncio.gather(
+                    *[db.users_repo.remove_user(uid) for uid in blocked_ids]
                 )
-                success += 1
+                logger.info(f"Broadcast: removed {len(blocked_ids)} blocked users.")
+
+            await status_msg.edit_text(
+                f"✅ <b>Broadcast ပြီးဆုံးပါပြီ</b>\n\n"
+                f"👥 စုစုပေါင်း: {total}\n"
+                f"✅ အောင်မြင်: {success}\n"
+                f"🚫 Block ပိတ် (ဖယ်ရှားပြီး): {blocked}\n"
+                f"⚠️ အခြားအမှား: {failed}",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            logger.exception("post_command broadcast failed:")
+            try:
+                await status_msg.edit_text("⚠️ Broadcast အတွင်း အမှားဖြစ်ပွားခဲ့သည်။")
             except Exception:
-                failed += 1
-        await asyncio.sleep(1.5)
+                pass
 
-    await update.message.reply_text(
-        f"✅ ပြီးဆုံးပါသည်။ အောင်မြင်မှု - {success}/{total} (Failed: {failed})"
-    )
-
+# ═══════════════════════════════════════
+# 🛠 FIXED: active_command now uses Users collection + banned set
+# ═══════════════════════════════════════
 @handle_errors
 async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
@@ -981,9 +1061,21 @@ async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _send_db_error(update)
     if not (await is_owner_or_master(update.effective_user.id, context)):
         return
-    count = await db.order_repo.get_total_users_count()
-    await update.message.reply_text(f"📊 လက်ရှိသုံးနေသူ {count} ယောက် ရှိပါသည်။")
 
+    banned_set = db._banned_set
+    total      = await db.users_repo.get_active_user_count(banned_set)
+    banned_ct  = len(banned_set)
+
+    await update.message.reply_text(
+        f"📊 <b>Bot အသုံးပြုသူ စာရင်း</b>\n\n"
+        f"👥 စုစုပေါင်း (ban မဟုတ်): <b>{total}</b>\n"
+        f"🚫 Ban လုပ်ထားသူ: <b>{banned_ct}</b>",
+        parse_mode="HTML"
+    )
+
+# ──────────────────────────────────────
+# Other admin commands (unchanged)
+# ──────────────────────────────────────
 @handle_errors
 async def set_welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db(context)
@@ -1130,8 +1222,10 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = lic["user_id"]
         expiry = lic.get("expiry_date")
         time_left = get_remaining_time_str(expiry)
+        # ── License list ခလုတ် → primary (အပြာ) ──
         keyboard.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}",
-                                              callback_data=f"license_view_{uid}")])
+                                              callback_data=f"license_view_{uid}",
+                                              style="primary")])
     await update.message.reply_text("📋 <b>လိုင်စင်စာရင်း</b>",
                                     parse_mode=ADMIN_PARSE_MODE,
                                     reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1150,10 +1244,13 @@ async def _handle_license_view(query, db, target):
         f"📊 အခြေအနေ: {get_remaining_time_str(expiry)}"
     )
     keyb = [
-        [InlineKeyboardButton("➕ 1 လတိုး", callback_data=f"license_add_1_{target}"),
-         InlineKeyboardButton("➕ 3 လတိုး", callback_data=f"license_add_3_{target}")],
-        [InlineKeyboardButton("🚫 လိုင်စင်ပိတ်မယ်", callback_data=f"license_revoke_{target}")],
-        [InlineKeyboardButton("🔙 စာရင်းသို့", callback_data="license_main_list")]
+        # ── လတိုးခလုတ်များ → success (အစိမ်း) ──
+        [InlineKeyboardButton("➕ 1 လတိုး", callback_data=f"license_add_1_{target}", style="success"),
+         InlineKeyboardButton("➕ 3 လတိုး", callback_data=f"license_add_3_{target}", style="success")],
+        # ── လိုင်စင်ပိတ် → danger (အနီ) ──
+        [InlineKeyboardButton("🚫 လိုင်စင်ပိတ်မယ်", callback_data=f"license_revoke_{target}", style="danger")],
+        # ── နောက်သို့ → primary (အပြာ) ──
+        [InlineKeyboardButton("🔙 စာရင်းသို့", callback_data="license_main_list", style="primary")]
     ]
     await query.edit_message_text(text,
                                   parse_mode=ADMIN_PARSE_MODE,
@@ -1167,8 +1264,10 @@ async def _handle_license_main_list(query, db):
         uid = lic["user_id"]
         expiry = lic.get("expiry_date")
         time_left = get_remaining_time_str(expiry)
+        # ── License list ခလုတ် → primary (အပြာ) ──
         keyb.append([InlineKeyboardButton(f"👤 ID: {uid} {time_left}",
-                                          callback_data=f"license_view_{uid}")])
+                                          callback_data=f"license_view_{uid}",
+                                          style="primary")])
     await query.edit_message_text("📋 <b>လိုင်စင်စာရင်း</b>",
                                   parse_mode=ADMIN_PARSE_MODE,
                                   reply_markup=InlineKeyboardMarkup(keyb))
