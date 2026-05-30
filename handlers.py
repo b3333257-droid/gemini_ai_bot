@@ -31,7 +31,7 @@ UC_ID_RE = re.compile(r"^(\d{5,20})$")
 SET_PRICE_RE = re.compile(r"/set(dia|uc)\s+(.+)", re.IGNORECASE)
 
 # Broadcast concurrency helpers
-_broadcast_lock = asyncio.Lock()
+_broadcast_lock = None                     # ပြင်ဆင်ချက် ၃
 
 class _SR(IntEnum):
     SUCCESS = 0
@@ -311,7 +311,8 @@ async def timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if update and update.effective_chat:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="⏰ အချိန်ကျော်သွားပါပြီ။ ၅ မိနစ်အတွင်း Game ID ထည့်သွင်းခြင်း မရှိသောကြောင့် အော်ဒါကို ပယ်ဖျက်လိုက်ပါသည်။\nကျေးဇူးပြု၍ /start မှ ပြန်လည်စတင်ပေးပါ။"
+            # ပြင်ဆင်ချက် ၂ – ၅ မိနစ် မှ ၁၅ မိနစ်သို့
+            text="⏰ အချိန်ကျော်သွားပါပြီ။ ၁၅ မိနစ်အတွင်း Game ID ထည့်သွင်းခြင်း မရှိသောကြောင့် အော်ဒါကို ပယ်ဖျက်လိုက်ပါသည်။\nကျေးဇူးပြု၍ /start မှ ပြန်လည်စတင်ပေးပါ။"
         )
     clear_order_context(context)
     return ConversationHandler.END
@@ -410,6 +411,10 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    # ပြင်ဆင်ချက် ၁ – callback query answer ခေါ်ခြင်း (loading spinner ပျောက်စေရန်)
+    if update.callback_query:
+        await update.callback_query.answer()
+
     welcome_msg_id = await db.settings_repo.get_config("welcome_msg_id")
     if welcome_msg_id:
         try:
@@ -425,7 +430,21 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
     else:
-        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+        # callback query case
+        msg = update.callback_query.message
+        if msg.photo:
+            # photo message ဖြစ်လျှင် caption ကိုပြင်မည်
+            try:
+                await msg.edit_caption(caption=text, reply_markup=reply_markup)
+            except Exception:
+                # မအောင်မြင်ပါက မက်ဆေ့ဟောင်းဖျက်ပြီး အသစ်ပို့မည်
+                await safe_delete_message(msg, context)
+                await context.bot.send_message(chat_id=msg.chat_id, text=text, reply_markup=reply_markup)
+        else:
+            try:
+                await msg.edit_text(text, reply_markup=reply_markup)
+            except Exception:
+                await msg.reply_text(text, reply_markup=reply_markup)
     return ConversationHandler.END
 
 @handle_errors
@@ -962,6 +981,11 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
         await update.message.reply_text("❌ ပို့ချင်သော Message ကို Reply လုပ်ပြီး /post ကိုသုံးပါ။")
         return
+
+    # ပြင်ဆင်ချက် ၃ – asyncio.Lock lazy initialization
+    global _broadcast_lock
+    if _broadcast_lock is None:
+        _broadcast_lock = asyncio.Lock()
 
     # Double-trigger guard – do not start if another broadcast is running
     if _broadcast_lock.locked():
