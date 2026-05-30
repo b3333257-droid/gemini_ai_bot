@@ -607,6 +607,11 @@ class LicenseRepository:
             return False
 
     async def close(self):
+        # ✅ Pending tasks များကို cancel လုပ်ပြီး ရှင်းထုတ်ခြင်း
+        async with self._pending_lock:
+            for task in self._pending.values():
+                task.cancel()
+            self._pending.clear()
         if self._own_session and self._session:
             await self._session.close()
             self._session = None
@@ -862,6 +867,12 @@ class DatabaseManager:
             await self.banned_repo.setup_indexes()
             await self.settings_repo.setup_indexes()
             await self.users_repo.setup_indexes()
+            # ✅ Nickname cache အတွက် compound unique index ထည့်ခြင်း
+            await self.db['nickname_cache'].create_index(
+                [("game_id", 1), ("zone_id", 1)],
+                unique=True,
+                background=True
+            )
             await self.db['nickname_cache'].create_index(
                 "timestamp", expireAfterSeconds=86400, background=True
             )
