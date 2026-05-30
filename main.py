@@ -7,6 +7,7 @@ import asyncio
 import time as _time
 import signal
 import secrets
+from collections import defaultdict
 from datetime import datetime, time, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -36,7 +37,7 @@ except ImportError:
     pass
 
 import master
-from master import MASTER_ID, check_ban          # 🛠 FIX: check_ban import
+from master import MASTER_ID, check_ban
 from database import DatabaseManager, UTC_TZ, _ensure_utc
 import handlers
 from handlers import (
@@ -151,7 +152,7 @@ def role_required(role: str = "admin"):
             user_id = update.effective_user.id
             allowed = master.is_master(user_id) if role == "master" else master.is_admin(user_id)
             if not allowed:
-                msg = "⛔ Master အခွင့်အရေး လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
+                msg = "⛔ Master အခွင့်အရေးသာ လိုအပ်ပါသည်။" if role == "master" else "⛔ အခွင့်အရေးမရှိပါ။"
                 if update.message:
                     await update.message.reply_text(msg)
                 elif update.callback_query:
@@ -306,7 +307,7 @@ async def purge_old_data_job(context):
 # Startup Notifications
 # ──────────────────────────────────────
 _startup_notification_sent = False
-_startup_lock = asyncio.Lock()          # 🛠 FIX: module‑level Lock
+_startup_lock = asyncio.Lock()
 
 async def _notify_startup_task(app):
     global _startup_notification_sent, _startup_lock
@@ -330,14 +331,17 @@ async def _notify_startup_task(app):
 
         owner_msg = (
             f"✅ <b>Bot Started Successfully</b>\n\n"
-            f"👤 <b>Owner:</b> {owner_name}\n"
-            f"🆔 <b>Owner ID:</b> <a href='tg://user?id={PRIMARY_ADMIN_ID}'>{PRIMARY_ADMIN_ID}</a>\n"
+            f"👤 <b>Owner:</b> <a href='tg://user?id={PRIMARY_ADMIN_ID}'>{owner_name}</a>\n"
+            f"🆔 <b>Owner ID:</b> <code>{PRIMARY_ADMIN_ID}</code>\n"
             f"🤖 <b>Bot:</b> {bot_username}\n"
             f"🕒 <b>Time:</b> {mmt_now}\n\n"
             f"Bot is now running and accepting commands."
         )
+
+        # owner ဆီပို့တာ fail → exception တက် → master ဆီပါမပို့ (error သိစေဖို့)
         await bot.send_message(chat_id=PRIMARY_ADMIN_ID, text=owner_msg, parse_mode="HTML")
 
+        # ── Master API သို့ notify (client mode သာ) ──
         db = app.bot_data.get('db')
         if db and db.license_repo.client_mode:
             http_session = app.bot_data.get('http_session')
@@ -345,6 +349,7 @@ async def _notify_startup_task(app):
                 app._master_api_notified = True
                 await _notify_master_api(bot, db.license_repo.master_url, db.license_repo.secret,
                                          PRIMARY_ADMIN_ID, http_session)
+
     except Exception as e:
         logger.exception("Startup notification task failed:")
 
@@ -412,9 +417,14 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             logger.error(f"Error notification failed: {e}")
 
 # ──────────────────────────────────────
-# Quart Web Server (integrated into main event loop)
+# Quart Web Server
 # ──────────────────────────────────────
 quart_app = Quart(__name__)
+
+# ✅ In-memory rate limiter အတွက်
+_api_call_times: dict = defaultdict(list)
+API_RATE_LIMIT = 10         # requests per minute per IP
+API_RATE_WINDOW = 60        # seconds
 
 def get_client_ip(request):
     if TRUST_PROXY:
@@ -422,6 +432,16 @@ def get_client_ip(request):
         if forwarded:
             return forwarded.split(",")[0].strip()
     return request.remote_addr
+
+def check_api_rate_limit(ip: str) -> bool:
+    now = _time.time()
+    calls = _api_call_times[ip]
+    # Remove entries older than window
+    _api_call_times[ip] = [t for t in calls if now - t < API_RATE_WINDOW]
+    if len(_api_call_times[ip]) >= API_RATE_LIMIT:
+        return False
+    _api_call_times[ip].append(now)
+    return True
 
 @quart_app.route('/')
 async def health_check():
@@ -440,6 +460,10 @@ async def health_check():
 @quart_app.route('/api/notify_startup', methods=['POST'])
 async def api_notify_startup():
     try:
+        ip = get_client_ip(request)
+        if not check_api_rate_limit(ip):
+            return jsonify({"error": "Too many requests"}), 429
+
         auth = request.headers.get('Authorization', '')
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
@@ -467,9 +491,10 @@ async def api_notify_startup():
         if not app_bot:
             return jsonify({"error": "Bot unavailable"}), 503
 
+        # ── 🛠 FIX: owner name ကို clickable link ချိတ်ထားတယ် ──
         msg = (
             f"🔔 <b>Client Bot Started</b>\n\n"
-            f"👤 <b>Owner:</b> {html.escape(owner_name)}\n"
+            f"👤 <b>Owner:</b> <a href='tg://user?id={admin_id}'>{html.escape(owner_name)}</a>\n"
             f"🆔 <b>User ID:</b> <code>{admin_id}</code>\n"
             f"🤖 <b>Bot:</b> {bot_username}\n"
             f"🕒 <b>Time:</b> {time_str}"
@@ -487,6 +512,10 @@ async def api_license_check(user_id: int):
         return jsonify({"error": "Database unavailable"}), 503
 
     try:
+        ip = get_client_ip(request)
+        if not check_api_rate_limit(ip):
+            return jsonify({"error": "Too many requests"}), 429
+
         auth = request.headers.get('Authorization', '')
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
@@ -494,8 +523,6 @@ async def api_license_check(user_id: int):
         if not secrets.compare_digest(token, API_SECRET_TOKEN):
             return jsonify({"error": "Unauthorized"}), 401
 
-        ip = get_client_ip(request)
-        # (simple rate limiting can be added here if needed)
         valid, expiry = await db.license_repo.check_license_local(user_id)
         if valid:
             return jsonify({"valid": True, "expiry": expiry.isoformat() if expiry else None}), 200
@@ -548,7 +575,7 @@ app = None
 async def main_async():
     global app, _startup_lock, _startup_notification_sent
 
-    _startup_lock = asyncio.Lock()      # already global, but safe
+    _startup_lock = asyncio.Lock()
     _startup_notification_sent = False
 
     app = (ApplicationBuilder()
@@ -581,7 +608,6 @@ async def main_async():
 
         await setup_jobs(app)
 
-        # Admin commands
         admin_commands = [
             ("setdia", set_dia_command),
             ("setuc", set_uc_command),
@@ -602,7 +628,6 @@ async def main_async():
         app.add_handler(CommandHandler("paid", master_paid_command))
         app.add_handler(CommandHandler("license", master_license_add_command))
 
-        # 🛠 FIX: Apply check_ban to user‑facing entry points
         conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(check_ban(step1_selection), pattern=r"^price_(dia|uc)_.+$"),
@@ -616,7 +641,7 @@ async def main_async():
                 WAIT_PAYMENT: [MessageHandler(filters.PHOTO, step4_payment)],
                 ConversationHandler.TIMEOUT: [
                     MessageHandler(filters.ALL & ~filters.COMMAND, timeout_handler),
-                    CallbackQueryHandler(timeout_handler, pattern=r"^(confirm_id|back_id|cancel_user_.*)$")
+                    CallbackQueryHandler(timeout_handler, pattern=r"^(show_dia|show_uc|price_.*|confirm_id|back_id|cancel_user_.*)$")
                 ]
             },
             fallbacks=[
@@ -637,7 +662,8 @@ async def main_async():
         app.add_error_handler(global_error_handler)
 
         await app.initialize()
-        await app.bot.delete_webhook(drop_pending_updates=False)
+        # ── 🛠 FIX: restart တိုင်း webhook ဖျက်ပြီး conflict spam လျှော့ချ ──
+        await app.bot.delete_webhook(drop_pending_updates=True)
         await app.start()
 
         quart_app.config['BOT_INSTANCE'] = app.bot
@@ -656,8 +682,9 @@ async def main_async():
             return
 
         try:
+            # ── 🛠 FIX: drop_pending_updates=True → restart တိုင်း conflict လျှော့ချ ──
             await app.updater.start_polling(
-                drop_pending_updates=False,
+                drop_pending_updates=True,
                 allowed_updates=None
             )
         except Conflict:
