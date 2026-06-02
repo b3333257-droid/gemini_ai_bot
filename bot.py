@@ -1,15 +1,12 @@
-# bot.py (Movie Storage removed — all movie dependencies cleaned)
+# bot.py
 import asyncio
-import html
 import os
-import signal
 import threading
 import time
 import logging
 from datetime import datetime, timedelta
-
 from flask import Flask
-from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import MongoClient
 from pymongo import ReturnDocument
 from telegram import Update, ChatPermissions
 from telegram.ext import (
@@ -24,8 +21,7 @@ from telegram.ext import (
 
 import sec
 import thd
-import cacu
-# import movie  ← removed
+import cacu          # <-- Calculator module
 
 # ── Logging ────────────────────────────────────────────────
 logging.basicConfig(
@@ -39,6 +35,7 @@ class Config:
     TOKEN      = os.environ.get("BOT_TOKEN")
     MONGO_URI  = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
     DB_NAME    = os.environ.get("DB_NAME", "telegram_bot_db")
+    SELF_URL   = os.environ.get("SELF_URL")
     FLASK_PORT = int(os.environ.get("PORT", 8080))
     OWNER_ID   = int(os.environ.get("OWNER_ID",   0))
     OWNER_ID_2 = int(os.environ.get("OWNER_ID_2", 0))
@@ -56,63 +53,45 @@ class Config:
 
 Config.validate()
 
-# ── Database (Async Motor) ──────────────────────────────
-mongo_client = AsyncIOMotorClient(
-    Config.MONGO_URI,
-    serverSelectionTimeoutMS=5000,
-    maxPoolSize=50
-)
-db                       = mongo_client[Config.DB_NAME]
-user_collection          = db["users"]
-admin_collection         = db["admins"]
-warn_collection          = db["warns"]
-chat_collection          = db["chats"]
-global_filter_collection = db["global_filters"]
+# ── Database ───────────────────────────────────────────────
+try:
+    mongo_client             = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000)
+    db                       = mongo_client[Config.DB_NAME]
+    user_collection          = db["users"]
+    admin_collection         = db["admins"]
+    warn_collection          = db["warns"]
+    chat_collection          = db["chats"]
+    global_filter_collection = db["global_filters"]
+    logger.info("Database ချိတ်ဆက်မှု အောင်မြင်ပါသည်။")
+except Exception as e:
+    logger.critical(f"MongoDB ချိတ်ဆက်မှု မအောင်မြင်ပါ: {e}")
+    raise
 
-async def init_db():
-    try:
-        await mongo_client.admin.command("ping")
-        logger.info("Database ချိတ်ဆက်မှု အောင်မြင်ပါသည်။")
-        await user_collection.create_index("user_id", unique=True)
-        await user_collection.create_index("username")
-        await admin_collection.create_index("user_id", unique=True)
-        await chat_collection.create_index("chat_id", unique=True)
-        await global_filter_collection.create_index(
-            [("keyword", 1), ("chat_id", 1)], unique=True
-        )
-        # ── FIX: creator_id index for dashboard performance ──
-        await global_filter_collection.create_index("creator_id")
-        await warn_collection.create_index(
-            [("chat_id", 1), ("user_id", 1)], unique=True
-        )
-        logger.info("MongoDB indexes ပြင်ဆင်ပြီးပါပြီ။")
-    except Exception as e:
-        logger.critical(f"MongoDB setup error: {e}")
-        raise
-
+# Inject → sec.py
 sec.global_filter_collection = global_filter_collection
 sec.user_collection          = user_collection
 sec.chat_collection          = chat_collection
 sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
 
+# Inject → thd.py
+thd.init_db(db)
 thd.OWNER_IDS = Config.OWNER_IDS
-
-# ── Cooldown (rate limiting) ────────────────────────────
-# (removed — only used by movie commands)
 
 # ── Permission caches ──────────────────────────────────────
 _admin_cache = {}
+# Bug fix: old structure {chat_id: {user_id: expire_time}} → re-fetched for every
+# non-admin user. New: {chat_id: {"admins": frozenset, "expires": float}}
 _group_admin_cache = {}
 
 def is_owner(user_id: int) -> bool:
     return user_id in Config.OWNER_IDS
 
-async def is_admin(user_id: int) -> bool:
+def is_admin(user_id: int) -> bool:
     now = time.time()
     if user_id in _admin_cache and now - _admin_cache[user_id] < 300:
         return True
-    if await admin_collection.find_one({"user_id": user_id}):
+    if admin_collection.find_one({"user_id": user_id}):
         _admin_cache[user_id] = now
         return True
     return False
@@ -123,19 +102,21 @@ async def is_group_admin(update: Update, user_id: int) -> bool:
         return False
     now = time.time()
     entry = _group_admin_cache.get(chat.id)
+    # Cache hit: entire admin set cached for 300 s (5 min)
     if entry and now < entry["expires"]:
         return user_id in entry["admins"]
+    # Cache miss or expired: fetch from Telegram
     try:
         admins   = await chat.get_administrators()
         admin_ids = frozenset(a.user.id for a in admins)
-        _group_admin_cache[chat.id] = {"admins": admin_ids, "expires": now + 60}
+        _group_admin_cache[chat.id] = {"admins": admin_ids, "expires": now + 300}
         return user_id in admin_ids
     except Exception as e:
         logger.error(f"Group admin စစ်ဆေးမှု error ({chat.id}): {e}")
         return False
 
 async def can_moderate(update: Update, user_id: int) -> bool:
-    return is_owner(user_id) or (await is_admin(user_id)) or (await is_group_admin(update, user_id))
+    return is_owner(user_id) or is_admin(user_id) or await is_group_admin(update, user_id)
 
 def is_strict_command(text: str, command: str, bot_username: str) -> bool:
     if not text:
@@ -143,48 +124,39 @@ def is_strict_command(text: str, command: str, bot_username: str) -> bool:
     first = text.split()[0]
     return first in (f"/{command}", f"/{command}@{bot_username or ''}")
 
-async def bot_has_admin_rights(chat, bot_id: int) -> bool:
-    try:
-        member = await chat.get_member(bot_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
-
-# ── FIX: check_hierarchy now blocks if issuer cannot be verified ──
 async def check_hierarchy(chat, issuer_id: int, target_id: int):
+    """None = OK to proceed.  str = error message."""
     if chat.type == "private":
         return None
     try:
         issuer = await chat.get_member(issuer_id)
         target = await chat.get_member(target_id)
-        if issuer.status == "creator" or is_owner(issuer_id) or (await is_admin(issuer_id)):
+        if issuer.status == "creator":
             return None
         if target.status in ("administrator", "creator"):
             return "❌ Admin အချင်းချင်း အရေးယူ၍မရပါ။"
     except Exception as e:
         logger.error(f"Hierarchy check error: {e}")
-        return "❌ အသုံးပြုသူအချက်အလက် စစ်ဆေး၍မရပါ။"
     return None
 
 class UserData:
+    """Lightweight stand-in when bot.get_chat() fails."""
     def __init__(self, user_id: int, username=None, first_name="Unknown"):
         self.id         = user_id
         self.username   = username
         self.first_name = first_name
 
 async def get_user_mention(bot, user_id: int) -> str:
-    # Try DB first
-    row = await user_collection.find_one({"user_id": user_id})
-    if row:
-        if row.get("username"):
-            return f"@{row['username']}"
-        name = html.escape(row.get("first_name", "Unknown"))
-        return f'<a href="tg://user?id={user_id}">{name}</a>'
-    # Fallback to API
     try:
         chat = await bot.get_chat(user_id)
         return f"@{chat.username}" if chat.username else chat.mention_html()
     except Exception:
+        row = user_collection.find_one({"user_id": user_id})
+        if row:
+            if row.get("username"):
+                return f"@{row['username']}"
+            name = row.get("first_name", "Unknown")
+            return f'<a href="tg://user?id={user_id}">{name}</a>'
         return str(user_id)
 
 async def get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,12 +166,13 @@ async def get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return None
     arg = context.args[0]
     try:
+        # Support negative IDs (e.g. -100xxxxxxxx) and plain integers
         if arg.lstrip("-").isdigit():
             uid = int(arg)
             try:
                 return await context.bot.get_chat(uid)
             except Exception:
-                row = await user_collection.find_one({"user_id": uid})
+                row = user_collection.find_one({"user_id": uid})
                 if row:
                     return UserData(uid, row.get("username"), row.get("first_name"))
         else:
@@ -207,7 +180,7 @@ async def get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 return await context.bot.get_chat(f"@{uname}")
             except Exception:
-                row = await user_collection.find_one({"username": uname})
+                row = user_collection.find_one({"username": uname})
                 if row:
                     return UserData(row["user_id"], row.get("username"), row.get("first_name"))
     except Exception as e:
@@ -228,7 +201,7 @@ async def sync_user_data(update: Update):
     try:
         full_name = getattr(user, "full_name", None) or \
                     f"{user.first_name or ''} {user.last_name or ''}".strip()
-        await user_collection.update_one(
+        user_collection.update_one(
             {"user_id": user.id},
             {"$set": {
                 "last_seen":  datetime.utcnow(),
@@ -250,7 +223,7 @@ async def sync_chat_data(update: Update):
     if chat.id in chat_sync_cache and now - chat_sync_cache[chat.id] < 3600:
         return
     try:
-        await chat_collection.update_one(
+        chat_collection.update_one(
             {"chat_id": chat.id},
             {"$set": {
                 "chat_id":   chat.id,
@@ -264,52 +237,37 @@ async def sync_chat_data(update: Update):
     except Exception as e:
         logger.error(f"Chat sync error {chat.id}: {e}")
 
-async def async_cache_cleaner():
+def cleanup_caches():
+    now = time.time()
+    for cache in (user_sync_cache, chat_sync_cache):
+        for k in [k for k, v in cache.items() if now - v > 7200]:
+            del cache[k]
+    for k in [k for k, v in _admin_cache.items() if now - v > 600]:
+        del _admin_cache[k]
+    # New cache structure: single expiry per chat
+    for cid in [c for c, e in _group_admin_cache.items() if now > e["expires"]]:
+        del _group_admin_cache[cid]
+    try:
+        sec.cleanup_chat_cooldowns()
+    except Exception as e:
+        logger.error(f"Cooldown cleanup error: {e}")
+
+def cache_cleaner_task():
     while True:
-        await asyncio.sleep(1800)
+        time.sleep(1800)
         try:
-            now = time.time()
-            for cache in (user_sync_cache, chat_sync_cache):
-                for k in [k for k, v in cache.items() if now - v > 7200]:
-                    del cache[k]
-            for k in [k for k, v in _admin_cache.items() if now - v > 600]:
-                del _admin_cache[k]
-            for cid in [c for c, e in _group_admin_cache.items() if now > e["expires"]]:
-                del _group_admin_cache[cid]
-            # Movie cooldown cleanup removed (no longer needed)
-            try:
-                sec.cleanup_chat_cooldowns()
-            except Exception as e:
-                logger.error(f"Cooldown cleanup error: {e}")
+            cleanup_caches()
         except Exception as e:
             logger.error(f"Cache cleaner error: {e}")
 
+# Bug fix: removed can_change_info=True / can_pin_messages=True —
+# regular members should not have admin-level permissions on unmute.
 MUTE_PERMISSIONS = ChatPermissions(can_send_messages=False)
 
-UNMUTE_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-    can_change_info=False,
-    can_invite_users=True,
-    can_pin_messages=False,
-)
-
-def require_bot_admin(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        chat = update.effective_chat
-        if chat and chat.type != "private":
-            if not await bot_has_admin_rights(chat, context.bot.id):
-                return await update.message.reply_text("❌ ကျွန်တော် admin မဖြစ်သေးပါ။ Admin ခန့်ပေးပါ။")
-        return await func(update, context, *args, **kwargs)
-    return wrapper
-
 # ══════════════════════════════════════════════════════════
-#  MODERATION COMMANDS
+#  MODERATION
 # ══════════════════════════════════════════════════════════
 
-@require_bot_admin
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "ban", context.bot.username or ""):
         return
@@ -324,19 +282,18 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_chat.ban_member(target.id)
         mention = await get_user_mention(context.bot, target.id)
-        issuer  = html.escape(update.effective_user.first_name or "Admin")
+        issuer  = update.effective_user
         await update.message.reply_text(
             f"🔨 <b>Ban လုပ်ပြီးပါပြီ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"👤 {mention}\n"
             f"🆔 <code>{target.id}</code>\n\n"
-            f"👮 By: <b>{issuer}</b>",
+            f"👮 By: <b>{issuer.first_name}</b>",
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "unban", context.bot.username or ""):
         return
@@ -351,19 +308,18 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_chat.unban_member(target.id)
         mention = await get_user_mention(context.bot, target.id)
-        issuer  = html.escape(update.effective_user.first_name or "Admin")
+        issuer  = update.effective_user
         await update.message.reply_text(
             f"✅ <b>Unban လုပ်ပြီးပါပြီ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"👤 {mention}\n"
             f"🆔 <code>{target.id}</code>\n\n"
-            f"👮 By: <b>{issuer}</b>",
+            f"👮 By: <b>{issuer.first_name}</b>",
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "mute", context.bot.username or ""):
         return
@@ -378,19 +334,18 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_chat.restrict_member(target.id, permissions=MUTE_PERMISSIONS)
         mention = await get_user_mention(context.bot, target.id)
-        issuer  = html.escape(update.effective_user.first_name or "Admin")
+        issuer  = update.effective_user
         await update.message.reply_text(
             f"🔇 <b>Mute လုပ်ပြီးပါပြီ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"👤 {mention}\n"
             f"🆔 <code>{target.id}</code>\n\n"
-            f"👮 By: <b>{issuer}</b>",
+            f"👮 By: <b>{issuer.first_name}</b>",
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "unmute", context.bot.username or ""):
         return
@@ -403,22 +358,29 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         return await update.message.reply_text(err)
     try:
-        chat = update.effective_chat
-        await chat.restrict_member(target.id, permissions=UNMUTE_PERMISSIONS)
+        # Bug fix: use the group's own default permissions so unmute restores
+        # exactly what members of that group are allowed to do — not a hardcoded set.
+        chat         = update.effective_chat
+        default_perms = chat.permissions or ChatPermissions(
+            can_send_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        )
+        await chat.restrict_member(target.id, permissions=default_perms)
         mention = await get_user_mention(context.bot, target.id)
-        issuer  = html.escape(update.effective_user.first_name or "Admin")
+        issuer  = update.effective_user
         await update.message.reply_text(
             f"🔊 <b>Unmute လုပ်ပြီးပါပြီ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"👤 {mention}\n"
             f"🆔 <code>{target.id}</code>\n\n"
-            f"👮 By: <b>{issuer}</b>",
+            f"👮 By: <b>{issuer.first_name}</b>",
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "warn", context.bot.username or ""):
         return
@@ -431,7 +393,7 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         return await update.message.reply_text(err)
     try:
-        warn_data = await warn_collection.find_one_and_update(
+        warn_data = warn_collection.find_one_and_update(
             {"chat_id": update.effective_chat.id, "user_id": target.id},
             {
                 "$inc": {"count": 1},
@@ -442,17 +404,17 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         current = warn_data.get("count", 1) if warn_data else 1
         mention = await get_user_mention(context.bot, target.id)
-        issuer  = html.escape(update.effective_user.first_name or "Admin")
+        issuer  = update.effective_user
         if current >= 3:
             await update.effective_chat.ban_member(target.id)
-            await warn_collection.delete_one({"chat_id": update.effective_chat.id, "user_id": target.id})
+            warn_collection.delete_one({"chat_id": update.effective_chat.id, "user_id": target.id})
             await update.message.reply_text(
                 f"🚫 <b>Ban ခံရပြီ</b>  <i>(warn ၃ ကြိမ် ပြည့်)</i>\n"
                 f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                 f"👤 {mention}\n"
                 f"🆔 <code>{target.id}</code>\n"
                 f"📊 Warns: 🟥🟥🟥  3/3\n\n"
-                f"👮 By: <b>{issuer}</b>",
+                f"👮 By: <b>{issuer.first_name}</b>",
                 parse_mode="HTML"
             )
         else:
@@ -463,14 +425,13 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 {mention}\n"
                 f"🆔 <code>{target.id}</code>\n"
                 f"📊 Warns: {bar}  {current}/3\n\n"
-                f"👮 By: <b>{issuer}</b>\n"
+                f"👮 By: <b>{issuer.first_name}</b>\n"
                 f"💡 <i>warn ၃ ကြိမ် = ban</i>",
                 parse_mode="HTML"
             )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_strict_command(update.message.text, "unwarn", context.bot.username or ""):
         return
@@ -483,7 +444,7 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         return await update.message.reply_text(err)
     try:
-        updated = await warn_collection.find_one_and_update(
+        updated = warn_collection.find_one_and_update(
             {"chat_id": update.effective_chat.id, "user_id": target.id, "count": {"$gt": 0}},
             {"$inc": {"count": -1}},
             return_document=ReturnDocument.AFTER
@@ -492,24 +453,24 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_count = updated.get("count", 0)
             mention   = await get_user_mention(context.bot, target.id)
             bar       = "🟥" * new_count + "⬜" * (3 - new_count)
-            issuer    = html.escape(update.effective_user.first_name or "Admin")
+            issuer    = update.effective_user
             await update.message.reply_text(
                 f"✅ <b>Warn ဖျက်ပြီးပါပြီ</b>\n"
                 f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                 f"👤 {mention}\n"
                 f"📊 Warns: {bar}  {new_count}/3\n\n"
-                f"👮 By: <b>{issuer}</b>",
+                f"👮 By: <b>{issuer.first_name}</b>",
                 parse_mode="HTML"
             )
             if new_count <= 0:
-                await warn_collection.delete_one({"chat_id": update.effective_chat.id, "user_id": target.id})
+                warn_collection.delete_one({"chat_id": update.effective_chat.id, "user_id": target.id})
         else:
-            await update.message.reply_text("❌ ဒီ user မှာ warn မရှိပါ။")
+            await update.message.reply_text("❌ ဤ user တွင် warn မရှိပါ။")
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
-@require_bot_admin
 async def warns_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check a user's current warn count."""
     if not is_strict_command(update.message.text, "warns", context.bot.username or ""):
         return
     if not await can_moderate(update, update.effective_user.id):
@@ -518,7 +479,7 @@ async def warns_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target:
         return await update.message.reply_text("❌ User ရှာမတွေ့ပါ။")
     try:
-        row   = await warn_collection.find_one({"chat_id": update.effective_chat.id, "user_id": target.id})
+        row   = warn_collection.find_one({"chat_id": update.effective_chat.id, "user_id": target.id})
         count = row.get("count", 0) if row else 0
         mention = await get_user_mention(context.bot, target.id)
         bar   = "🟥" * count + "⬜" * (3 - count)
@@ -530,22 +491,20 @@ async def warns_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 # ══════════════════════════════════════════════════════════
 #  BOT ADMIN COMMANDS
 # ══════════════════════════════════════════════════════════
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "admin", context.bot.username or ""):
-        return
     if not is_owner(update.effective_user.id):
         return await update.message.reply_text("❌ Bot owner သာ admin ထည့်နိုင်သည်။")
     target = await get_target_user(update, context)
     if not target:
         return await update.message.reply_text("❌ User ရှာမတွေ့ပါ။")
     try:
-        await admin_collection.update_one(
+        admin_collection.update_one(
             {"user_id": target.id},
             {"$set": {"user_id": target.id, "added_by": update.effective_user.id,
                       "added_at": datetime.utcnow()}},
@@ -561,11 +520,9 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "unadmin", context.bot.username or ""):
-        return
     if not is_owner(update.effective_user.id):
         return await update.message.reply_text("❌ Bot owner သာ admin ဖယ်ရှားနိုင်သည်။")
     target = await get_target_user(update, context)
@@ -574,7 +531,7 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target.id in Config.OWNER_IDS:
         return await update.message.reply_text("❌ Owner ကို ဖယ်ရှား၍မရပါ။")
     try:
-        await admin_collection.delete_one({"user_id": target.id})
+        admin_collection.delete_one({"user_id": target.id})
         _admin_cache.pop(target.id, None)
         mention = await get_user_mention(context.bot, target.id)
         await update.message.reply_text(
@@ -585,13 +542,11 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "adminlist", context.bot.username or ""):
-        return
     user_id = update.effective_user.id
-    if not (is_owner(user_id) or (await is_admin(user_id))):
+    if not (is_owner(user_id) or is_admin(user_id)):
         return await update.message.reply_text("❌ Bot admin / owner သာ ကြည့်နိုင်သည်။")
     try:
         text = "🛡 <b>Bot Admin Panel</b>\n━━━━━━━━━━━━━━━\n\n👑 <b>Owners</b>\n"
@@ -601,7 +556,7 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mention = await get_user_mention(context.bot, oid)
             text   += f"{prefix} {mention} · <code>{oid}</code>\n"
 
-        admins = await admin_collection.find({"user_id": {"$nin": list(Config.OWNER_IDS)}}).to_list(length=None)
+        admins = list(admin_collection.find({"user_id": {"$nin": list(Config.OWNER_IDS)}}))
         text  += f"\n🔰 <b>Admins</b> ({len(admins)})\n"
         if admins:
             for i, doc in enumerate(admins):
@@ -612,16 +567,18 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "└ <i>Admin မရှိသေးပါ။</i>"
         await update.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
+
+# ══════════════════════════════════════════════════════════
+#  BASIC
+# ══════════════════════════════════════════════════════════
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "start", context.bot.username or ""):
-        return
     await sync_user_data(update)
     await sync_chat_data(update)
     user = update.effective_user
     await update.message.reply_text(
-        f"👋 <b>မင်္ဂလာပါ, {html.escape(user.first_name or 'User')}!</b>\n\n"
+        f"👋 <b>မင်္ဂလာပါ, {user.first_name}!</b>\n\n"
         f"ကျွန်တော်သည် group စီမံခန့်ခွဲမှု bot ဖြစ်ပါသည်။\n\n"
         f"🔨 Moderation  •  🔎 Filters  •  👋 Greetings\n\n"
         f"📌 /help — command အားလုံး ကြည့်ရန်",
@@ -633,8 +590,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 
 async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "filter", context.bot.username or ""):
-        return
     await sync_user_data(update)
     await sync_chat_data(update)
     reply_message        = update.message.reply_to_message
@@ -661,6 +616,8 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return await update.message.reply_text("❌ Text သို့မဟုတ် Sticker reply သာ ရပါသည်။")
 
         elif context.args and " - " in " ".join(context.args):
+            # Bug fix: use " - " (space-dash-space) as separator so keywords
+            # that contain "-" (e.g. "hi-there") are not split incorrectly.
             full_text = " ".join(context.args)
             parts     = full_text.split(" - ", 1)
             if len(parts) != 2:
@@ -683,7 +640,7 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         final_chat_id = None
         scope_message = ""
-        if is_owner(user_id) or (await is_admin(user_id)):
+        if is_owner(user_id) or is_admin(user_id):
             final_chat_id = "global"
             scope_message = "🌐 Global"
         elif update.effective_chat.type in ["group", "supergroup"]:
@@ -696,31 +653,26 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             return await update.message.reply_text("❌ Group ထဲမှသာ ထည့်နိုင်သည်။")
 
-        # ── FIX: check filter limit and notify user ──
-        success = await sec.add_global_filter(
+        await sec.add_global_filter(
             keyword=filter_keyword, reply=filter_reply_content,
             creator_id=user_id, creator_name=update.effective_user.first_name,
             chat_id=final_chat_id, is_sticker=is_sticker_filter
         )
-        if not success:
-            return await update.message.reply_text(
-                "❌ Filter limit ပြည့်နေပါပြီ။ Admin တစ်ဦးလျှင် အများဆုံး 500 filter သာ ထည့်နိုင်ပါသည်။"
-            )
-
         msg_type = "🎭 Sticker" if is_sticker_filter else "💬 Text"
         await update.message.reply_text(
             f"✅ <b>Filter ထည့်ပြီးပါပြီ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"🔑 Keyword: <code>{html.escape(filter_keyword)}</code>\n"
+            f"🔑 Keyword: <code>{filter_keyword}</code>\n"
             f"📍 Scope: {scope_message}\n"
             f"📁 Type: {msg_type}",
             parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"add_filter error: {e}")
-        await update.message.reply_text(f"❌ Filter ထည့်ရာတွင် error ဖြစ်ပါသည်: {html.escape(str(e))}")
+        await update.message.reply_text(f"❌ Filter ထည့်ရာတွင် error ဖြစ်ပါသည်: {e}")
 
 async def del_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a filter by keyword. Group admins can delete local; bot admins/owners can delete global."""
     if not is_strict_command(update.message.text, "delfilter", context.bot.username or ""):
         return
     if not context.args:
@@ -733,7 +685,8 @@ async def del_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyword = " ".join(context.args).lower().strip()
 
     deleted = False
-    if is_owner(user_id) or (await is_admin(user_id)):
+    if is_owner(user_id) or is_admin(user_id):
+        # Try global first, then local
         deleted = await sec.delete_filter_by_keyword(keyword, "global")
         if not deleted and update.effective_chat.type in ["group", "supergroup"]:
             deleted = await sec.delete_filter_by_keyword(keyword, chat_id)
@@ -748,21 +701,19 @@ async def del_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if deleted:
         await update.message.reply_text(
-            f"✅ Filter <code>{html.escape(keyword)}</code> ဖျက်ပြီးပါပြီ", parse_mode="HTML"
+            f"✅ Filter <code>{keyword}</code> ဖျက်ပြီးပါပြီ", parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
-            f"❌ <code>{html.escape(keyword)}</code> Filter မတွေ့ပါ။", parse_mode="HTML"
+            f"❌ <code>{keyword}</code> Filter မတွေ့ပါ။", parse_mode="HTML"
         )
 
 async def filter_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "filterlist", context.bot.username or ""):
-        return
     await sync_user_data(update)
     if update.effective_chat.type != "private":
         return await update.message.reply_text("❌ Filter dashboard ကို private chat ထဲမှသာ ကြည့်နိုင်သည်။")
     user_id = update.effective_user.id
-    if not (is_owner(user_id) or (await is_admin(user_id))):
+    if not (is_owner(user_id) or is_admin(user_id)):
         return await update.message.reply_text("❌ Bot admin / owner သာ ကြည့်နိုင်သည်။")
     try:
         markup = await sec.show_dashboard_admin(context.bot, user_id, page=1)
@@ -776,11 +727,9 @@ async def filter_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("❌ Dashboard ဖွင့်၍မရပါ။")
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 async def broadcast_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "post", context.bot.username or ""):
-        return
     await sync_user_data(update)
     await sync_chat_data(update)
     if not is_owner(update.effective_user.id):
@@ -803,41 +752,34 @@ async def broadcast_post_command(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ <b>Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 # ══════════════════════════════════════════════════════════
-#  AUTO REPLY + Calculator
+#  AUTO REPLY
 # ══════════════════════════════════════════════════════════
 
 async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or (not update.message.text and not update.message.caption):
         return
-
-    text = (update.message.text or update.message.caption or "").strip()
-
-    if text.startswith("."):
-        return
-
-    # Movie session check removed (no longer needed)
-
     await sync_user_data(update)
     await sync_chat_data(update)
-
     bot       = context.bot
     is_direct = False
     reply_msg = update.message.reply_to_message
+    # Bug fix: from_user is None for anonymous admins
     if reply_msg and reply_msg.from_user and reply_msg.from_user.id == bot.id:
         is_direct = True
     elif bot.username and f"@{bot.username}" in (update.message.text or update.message.caption or ""):
         is_direct = True
 
-    if any(op in text for op in "+-*/="):
-        if cacu.is_math_expression(text):
-            result = cacu.safe_calculate(text)
-            if result is not None:
-                reply = cacu.format_result(text, result)
-                await update.message.reply_text(reply, parse_mode="HTML")
-                return
+    # ── Calculator check (filter ထက် ဦးစားပေး) ──
+    text = update.message.text or update.message.caption or ""
+    if cacu.is_math_expression(text):
+        result = cacu.safe_calculate(text)
+        if result is not None:
+            reply = cacu.format_result(text, result)
+            await update.message.reply_text(reply, parse_mode="HTML")
+            return       # calculator ဖြေပြီးရင် filter မစစ်တော့ပါ
 
     try:
         await sec.auto_reply(update, is_direct=is_direct)
@@ -847,11 +789,6 @@ async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ══════════════════════════════════════════════════════════
 #  HANDLER REGISTRATION
 # ══════════════════════════════════════════════════════════
-
-async def help_command_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_strict_command(update.message.text, "help", context.bot.username or ""):
-        return
-    await thd.help_cmd(update, context)
 
 def register_all_handlers(application):
     commands = [
@@ -866,7 +803,7 @@ def register_all_handlers(application):
         ("unadmin",    remove_admin),
         ("adminlist",  list_admins),
         ("start",      start_command),
-        ("help",       help_command_wrapper),
+        ("help",       thd.help_cmd),
         ("filter",     add_filter_command),
         ("delfilter",  del_filter_command),
         ("filterlist", filter_list_command),
@@ -879,10 +816,6 @@ def register_all_handlers(application):
     for cmd, handler in commands:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(ChatMemberHandler(thd.member_status_handler, ChatMemberHandler.CHAT_MEMBER))
-
-    # Movie handlers removed
-    # (No .mv / .seri ... regex handler, no session handler)
-
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
         auto_reply_handler
@@ -890,7 +823,10 @@ def register_all_handlers(application):
     application.add_handler(CallbackQueryHandler(sec.handle_callback))
     logger.info("Handler အားလုံး မှတ်ပုံတင်ပြီးပါပြီ။")
 
-# ── Flask app ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  FLASK & SELF-PING
+# ══════════════════════════════════════════════════════════
+
 app_flask = Flask(__name__)
 
 @app_flask.route("/")
@@ -903,76 +839,76 @@ def run_flask_app():
     except Exception as e:
         logger.critical(f"Flask error: {e}")
 
-# ── Database maintenance (async) ─────────────────────────
-async def prune_inactive_users():
+def self_ping_task():
+    if not Config.SELF_URL:
+        logger.warning("SELF_URL မသတ်မှတ်ရသေးပါ။")
+        return
+    import requests
+    while True:
+        try:
+            requests.get(Config.SELF_URL, timeout=10)
+        except Exception as e:
+            logger.error(f"Self-ping error: {e}")
+        time.sleep(300)
+
+# ══════════════════════════════════════════════════════════
+#  DATABASE MAINTENANCE
+# ══════════════════════════════════════════════════════════
+
+def prune_inactive_users():
     cutoff = datetime.utcnow() - timedelta(days=90)
-    result = await user_collection.delete_many({
+    result = user_collection.delete_many({
         "last_seen": {"$lt": cutoff},
         "user_id":   {"$nin": list(Config.OWNER_IDS)}
     })
     logger.info(f"Pruned {result.deleted_count} inactive users.")
 
-async def prune_inactive_chats():
+def prune_inactive_chats():
     cutoff = datetime.utcnow() - timedelta(days=180)
-    result = await chat_collection.delete_many({"last_seen": {"$lt": cutoff}})
+    result = chat_collection.delete_many({"last_seen": {"$lt": cutoff}})
     logger.info(f"Pruned {result.deleted_count} inactive chats.")
 
-async def auto_prune_scheduler():
+def auto_prune_scheduler():
     while True:
-        await asyncio.sleep(86400)
         try:
-            await prune_inactive_users()
-            await prune_inactive_chats()
+            prune_inactive_users()
+            prune_inactive_chats()
         except Exception as e:
             logger.error(f"Auto-prune error: {e}")
+        time.sleep(86400)
 
-# ── Main ─────────────────────────────────────────────────
-async def main():
-    logger.info("Application starting...")
-    await init_db()
+def setup_mongodb_indexes():
+    try:
+        user_collection.create_index("user_id", unique=True)
+        admin_collection.create_index("user_id", unique=True)
+        chat_collection.create_index("chat_id", unique=True)
+        global_filter_collection.create_index([("keyword", 1), ("chat_id", 1)], unique=True)
+        warn_collection.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+        logger.info("MongoDB indexes ပြင်ဆင်ပြီးပါပြီ။")
+    except Exception as e:
+        logger.error(f"Index setup error: {e}")
 
-    await thd.init_db(db)
-    # movie.init_movie_module(db) removed
+# ══════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════
 
+def main():
+    logger.info("Bot စတင်နေပါသည်...")
+    setup_mongodb_indexes()
     application = ApplicationBuilder().token(Config.TOKEN).build()
     register_all_handlers(application)
 
-    async def error_handler(update, context):
-        logger.error(msg="Exception while handling update:", exc_info=context.error)
-    application.add_error_handler(error_handler)
-
-    asyncio.create_task(async_cache_cleaner())
-    asyncio.create_task(auto_prune_scheduler())
-
-    threading.Thread(target=run_flask_app, daemon=True).start()
-
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    async def shutdown(signal_name):
-        logger.info(f"Received {signal_name}, shutting down...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        mongo_client.close()
-        logger.info("Cleanup done. Exiting.")
-        stop_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s.name)))
-        except NotImplementedError:
-            pass
+    threading.Thread(target=run_flask_app,       daemon=True).start()
+    threading.Thread(target=self_ping_task,       daemon=True).start()
+    threading.Thread(target=auto_prune_scheduler, daemon=True).start()
+    threading.Thread(target=cache_cleaner_task,   daemon=True).start()
 
     logger.info("Bot polling စတင်ပါပြီ...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
-    await stop_event.wait()
+    application.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except ValueError as ve:
         logger.critical(f"Config error: {ve}")
     except Exception as e:
