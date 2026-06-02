@@ -890,9 +890,14 @@ async def main():
     await application.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
 
 if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except ValueError as ve:
         logger.critical(f"Config error: {ve}")
     except Exception as e:
         logger.critical(f"Unhandled error: {e}")
+    finally:
+        if not loop.is_closed():
+            loop.close()
