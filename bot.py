@@ -10,6 +10,7 @@ from pymongo import MongoClient
 from pymongo import ReturnDocument
 from telegram import Update, ChatPermissions
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -74,15 +75,12 @@ sec.chat_collection          = chat_collection
 sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
 
-# Inject → thd.py
-thd.init_db(db)
+# Inject → thd.py (OWNER_IDS only — init_db is called via post_init hook below)
 thd.OWNER_IDS = Config.OWNER_IDS
 
 # ── Permission caches ──────────────────────────────────────
-_admin_cache = {}
-# Bug fix: old structure {chat_id: {user_id: expire_time}} → re-fetched for every
-# non-admin user. New: {chat_id: {"admins": frozenset, "expires": float}}
-_group_admin_cache = {}
+_admin_cache       = {}
+_group_admin_cache = {}   # {chat_id: {"admins": frozenset, "expires": float}}
 
 def is_owner(user_id: int) -> bool:
     return user_id in Config.OWNER_IDS
@@ -100,14 +98,12 @@ async def is_group_admin(update: Update, user_id: int) -> bool:
     chat = update.effective_chat
     if not chat or chat.type == "private":
         return False
-    now = time.time()
+    now   = time.time()
     entry = _group_admin_cache.get(chat.id)
-    # Cache hit: entire admin set cached for 300 s (5 min)
     if entry and now < entry["expires"]:
         return user_id in entry["admins"]
-    # Cache miss or expired: fetch from Telegram
     try:
-        admins   = await chat.get_administrators()
+        admins    = await chat.get_administrators()
         admin_ids = frozenset(a.user.id for a in admins)
         _group_admin_cache[chat.id] = {"admins": admin_ids, "expires": now + 300}
         return user_id in admin_ids
@@ -166,7 +162,6 @@ async def get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return None
     arg = context.args[0]
     try:
-        # Support negative IDs (e.g. -100xxxxxxxx) and plain integers
         if arg.lstrip("-").isdigit():
             uid = int(arg)
             try:
@@ -244,7 +239,6 @@ def cleanup_caches():
             del cache[k]
     for k in [k for k, v in _admin_cache.items() if now - v > 600]:
         del _admin_cache[k]
-    # New cache structure: single expiry per chat
     for cid in [c for c, e in _group_admin_cache.items() if now > e["expires"]]:
         del _group_admin_cache[cid]
     try:
@@ -260,8 +254,7 @@ def cache_cleaner_task():
         except Exception as e:
             logger.error(f"Cache cleaner error: {e}")
 
-# Bug fix: removed can_change_info=True / can_pin_messages=True —
-# regular members should not have admin-level permissions on unmute.
+# Bug fix: regular members should not have admin-level permissions on unmute.
 MUTE_PERMISSIONS = ChatPermissions(can_send_messages=False)
 
 # ══════════════════════════════════════════════════════════
@@ -359,8 +352,8 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(err)
     try:
         # Bug fix: use the group's own default permissions so unmute restores
-        # exactly what members of that group are allowed to do — not a hardcoded set.
-        chat         = update.effective_chat
+        # exactly what members of that group are allowed to do.
+        chat          = update.effective_chat
         default_perms = chat.permissions or ChatPermissions(
             can_send_messages=True,
             can_send_polls=True,
@@ -470,7 +463,6 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ <b>Error:</b> <code>{e}</code>", parse_mode="HTML")
 
 async def warns_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check a user's current warn count."""
     if not is_strict_command(update.message.text, "warns", context.bot.username or ""):
         return
     if not await can_moderate(update, update.effective_user.id):
@@ -479,10 +471,10 @@ async def warns_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target:
         return await update.message.reply_text("❌ User ရှာမတွေ့ပါ။")
     try:
-        row   = warn_collection.find_one({"chat_id": update.effective_chat.id, "user_id": target.id})
-        count = row.get("count", 0) if row else 0
+        row     = warn_collection.find_one({"chat_id": update.effective_chat.id, "user_id": target.id})
+        count   = row.get("count", 0) if row else 0
         mention = await get_user_mention(context.bot, target.id)
-        bar   = "🟥" * count + "⬜" * (3 - count)
+        bar     = "🟥" * count + "⬜" * (3 - count)
         await update.message.reply_text(
             f"📊 <b>Warn အခြေအနေ</b>\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -549,7 +541,7 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (is_owner(user_id) or is_admin(user_id)):
         return await update.message.reply_text("❌ Bot admin / owner သာ ကြည့်နိုင်သည်။")
     try:
-        text = "🛡 <b>Bot Admin Panel</b>\n━━━━━━━━━━━━━━━\n\n👑 <b>Owners</b>\n"
+        text       = "🛡 <b>Bot Admin Panel</b>\n━━━━━━━━━━━━━━━\n\n👑 <b>Owners</b>\n"
         owner_list = [oid for oid in (Config.OWNER_ID, Config.OWNER_ID_2) if oid]
         for i, oid in enumerate(owner_list):
             prefix  = "└" if i == len(owner_list) - 1 else "├"
@@ -617,7 +609,7 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         elif context.args and " - " in " ".join(context.args):
             # Bug fix: use " - " (space-dash-space) as separator so keywords
-            # that contain "-" (e.g. "hi-there") are not split incorrectly.
+            # that contain "-" are not split incorrectly.
             full_text = " ".join(context.args)
             parts     = full_text.split(" - ", 1)
             if len(parts) != 2:
@@ -653,11 +645,20 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             return await update.message.reply_text("❌ Group ထဲမှသာ ထည့်နိုင်သည်။")
 
-        await sec.add_global_filter(
-            keyword=filter_keyword, reply=filter_reply_content,
-            creator_id=user_id, creator_name=update.effective_user.first_name,
-            chat_id=final_chat_id, is_sticker=is_sticker_filter
+        # FIX: check return value — False means limit exceeded or DB error
+        success = await sec.add_global_filter(
+            keyword=filter_keyword,
+            reply=filter_reply_content,
+            creator_id=user_id,
+            creator_name=update.effective_user.first_name,
+            chat_id=final_chat_id,
+            is_sticker=is_sticker_filter
         )
+        if not success:
+            return await update.message.reply_text(
+                "❌ Filter ထည့်၍မရပါ။ Filter limit ပြည့်နေနိုင်သည် သို့မဟုတ် DB error ဖြစ်နိုင်သည်။"
+            )
+
         msg_type = "🎭 Sticker" if is_sticker_filter else "💬 Text"
         await update.message.reply_text(
             f"✅ <b>Filter ထည့်ပြီးပါပြီ</b>\n"
@@ -672,7 +673,6 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Filter ထည့်ရာတွင် error ဖြစ်ပါသည်: {e}")
 
 async def del_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete a filter by keyword. Group admins can delete local; bot admins/owners can delete global."""
     if not is_strict_command(update.message.text, "delfilter", context.bot.username or ""):
         return
     if not context.args:
@@ -779,7 +779,7 @@ async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if result is not None:
             reply = cacu.format_result(text, result)
             await update.message.reply_text(reply, parse_mode="HTML")
-            return       # calculator ဖြေပြီးရင် filter မစစ်တော့ပါ
+            return
 
     try:
         await sec.auto_reply(update, is_direct=is_direct)
@@ -889,13 +889,36 @@ def setup_mongodb_indexes():
         logger.error(f"Index setup error: {e}")
 
 # ══════════════════════════════════════════════════════════
+#  POST-INIT HOOK  ← FIX: thd.init_db awaited here
+# ══════════════════════════════════════════════════════════
+
+async def post_init(application: Application) -> None:
+    """
+    PTB v20 post_init hook — runs inside the event loop after the application
+    is built but before polling starts. Safe place to await async DB init.
+    """
+    try:
+        await thd.init_db(db)
+        logger.info("thd.init_db completed successfully via post_init.")
+    except Exception as e:
+        logger.critical(f"post_init: thd.init_db failed: {e}")
+        raise
+
+# ══════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════
 
 def main():
     logger.info("Bot စတင်နေပါသည်...")
     setup_mongodb_indexes()
-    application = ApplicationBuilder().token(Config.TOKEN).build()
+
+    # FIX: post_init hook passes thd.init_db into the event loop correctly
+    application = (
+        ApplicationBuilder()
+        .token(Config.TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     register_all_handlers(application)
 
     threading.Thread(target=run_flask_app,       daemon=True).start()
