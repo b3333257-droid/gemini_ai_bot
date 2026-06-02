@@ -21,7 +21,7 @@ from telegram.ext import (
 
 import sec
 import thd
-import cacu          # <-- Calculator module
+import cacu
 
 # ── Logging ────────────────────────────────────────────────
 logging.basicConfig(
@@ -74,8 +74,7 @@ sec.chat_collection          = chat_collection
 sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
 
-# Inject → thd.py
-# thd.init_db will be called later in main()
+# Inject → thd.py (init_db will be called later)
 
 # ── Permission caches ──────────────────────────────────────
 _admin_cache = {}
@@ -875,29 +874,46 @@ async def setup_mongodb_indexes():
 async def main():
     logger.info("Bot စတင်နေပါသည်...")
     await setup_mongodb_indexes()
-    # thd.init_db must be called after DB is ready; it uses welcome_settings collection
     await thd.init_db(db)
-    # v22.7: Application.builder() is the recommended way
+
     application = Application.builder().token(Config.TOKEN).build()
     register_all_handlers(application)
 
+    # Start background threads
     threading.Thread(target=run_flask_app,       daemon=True).start()
     threading.Thread(target=self_ping_task,       daemon=True).start()
     threading.Thread(target=cache_cleaner_task,   daemon=True).start()
-    asyncio.create_task(auto_prune_scheduler())   # run in the same event loop
+
+    # Start the prune scheduler as a task so we can cancel it on shutdown
+    prune_task = asyncio.create_task(auto_prune_scheduler())
+
+    # Initialize and start the bot application
+    await application.initialize()
+    await application.start()
 
     logger.info("Bot polling စတင်ပါပြီ...")
-    await application.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
+    await application.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
+
+    # Wait until the application stops (e.g. by signal)
+    # We'll just run forever until the process is interrupted
+    try:
+        await asyncio.Event().wait()  # block until cancelled
+    except asyncio.CancelledError:
+        pass
+
+    # Graceful shutdown
+    prune_task.cancel()
+    try:
+        await prune_task
+    except asyncio.CancelledError:
+        pass
+
+    await application.stop()
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except ValueError as ve:
         logger.critical(f"Config error: {ve}")
     except Exception as e:
         logger.critical(f"Unhandled error: {e}")
-    finally:
-        if not loop.is_closed():
-            loop.close()
