@@ -2,7 +2,7 @@
 import html as html_lib
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -196,7 +196,7 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Motor: update_one must be awaited
         await welcome_settings_collection.update_one(
             {"chat_id": target_chat_id},
-            {"$set": {"welcome_text": text, "updated_at": datetime.utcnow()}},
+            {"$set": {"welcome_text": text, "updated_at": datetime.now(timezone.utc)}},
             upsert=True
         )
         await update.message.reply_text(
@@ -233,7 +233,7 @@ async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await welcome_settings_collection.update_one(
             {"chat_id": target_chat_id},
-            {"$set": {"goodbye_text": text, "updated_at": datetime.utcnow()}},
+            {"$set": {"goodbye_text": text, "updated_at": datetime.now(timezone.utc)}},
             upsert=True
         )
         await update.message.reply_text(
