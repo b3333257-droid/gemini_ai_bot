@@ -1,4 +1,4 @@
-python-telegram-bot==22.7
-motor==3.7.0
-Flask==3.0.3
-requests==2.32.3
+python-telegram-bot[job-queue]==22.7
+motor==3.5.1
+flask==3.0.0
+requests==2.31.0
