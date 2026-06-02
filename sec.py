@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -23,19 +23,18 @@ chat_collection          = None
 OWNER_IDS: frozenset = frozenset()
 
 # ── Filter cache ────────────────────────────────────────────
-_filter_cache      = {}   # {chat_id: [filters]}
-_filter_cache_time = {}   # {chat_id: float}
+_filter_cache      = {}
+_filter_cache_time = {}
 FILTER_CACHE_TTL   = 1200  # 20 minutes
 
 # ── Cooldown state ──────────────────────────────────────────
-chat_cooldowns = {}   # {chat_id: {"count", "cooldown_until", "last_active"}}
+chat_cooldowns = {}
 
 # ── FILTER LIMIT (prevent abuse) ──────────────────────────
-MAX_FILTERS_PER_ADMIN = 500  # bot admin တစ်ဦးလျှင် အများဆုံး filter အရေအတွက်
+MAX_FILTERS_PER_ADMIN = 500
 
 # ── Owner helper ────────────────────────────────────────────
 def get_owner_ids() -> frozenset:
-    """Return injected OWNER_IDS; fall back to env vars if not yet injected."""
     if OWNER_IDS:
         return OWNER_IDS
     ids = set()
@@ -66,17 +65,15 @@ def cleanup_chat_cooldowns():
 # ══════════════════════════════════════════════════════════
 
 async def _load_filter_cache(chat_id):
-    """Load filters for a chat from DB (global + local), with TTL cache."""
     now = time.time()
     if chat_id in _filter_cache_time and (now - _filter_cache_time[chat_id] < FILTER_CACHE_TTL):
         return _filter_cache.get(chat_id, [])
     try:
-        # Motor: use to_list() to execute the find
         cursor = global_filter_collection.find(
             {"chat_id": {"$in": [chat_id, "global"]}},
             {"keyword": 1, "reply": 1, "is_sticker": 1, "_id": 0}
         )
-        rows = await cursor.to_list(length=None)  # fetch all
+        rows = await cursor.to_list(length=None)
         _filter_cache[chat_id]      = rows
         _filter_cache_time[chat_id] = now
         logger.debug(f"Filter cache loaded: {len(rows)} entries for chat {chat_id}.")
@@ -89,10 +86,6 @@ async def _load_filter_cache(chat_id):
         return _filter_cache.get(chat_id, [])
 
 def _invalidate_filter_cache(chat_id=None):
-    """
-    If chat_id is None or 'global': clear everything (global filters affect all chats).
-    Otherwise: clear only that specific chat's cache.
-    """
     if chat_id is None or chat_id == "global":
         _filter_cache.clear()
         _filter_cache_time.clear()
@@ -109,10 +102,6 @@ def _invalidate_filter_cache(chat_id=None):
 async def add_global_filter(keyword: str, reply: str, creator_id: int,
                              creator_name: str, chat_id="global",
                              is_sticker: bool = False) -> bool:
-    """
-    Add a filter. Returns True if added, False if limit exceeded.
-    (bot.py မှ return value စစ်ပြီး error ပြနိုင်ရန်)
-    """
     if global_filter_collection is None:
         logger.error("global_filter_collection not initialized.")
         return False
@@ -125,7 +114,6 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
             logger.warning(f"Filter reply too long ({len(reply)} chars), truncating.")
             reply = reply[:4000]
 
-        # ── FIX: filter limit per bot admin (global scope) ──
         if chat_id == "global":
             current_count = await global_filter_collection.count_documents(
                 {"creator_id": creator_id, "chat_id": "global"}
@@ -143,7 +131,7 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
             "creator_name": creator_name,
             "chat_id":      chat_id,
             "is_sticker":   is_sticker,
-            "created_at":   datetime.utcnow(),
+            "created_at":   datetime.now(timezone.utc),
         }
         await global_filter_collection.update_one(
             {"keyword": cleaned, "chat_id": chat_id},
@@ -161,10 +149,6 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
         return False
 
 async def delete_filter_by_keyword(keyword: str, chat_id) -> bool:
-    """
-    Delete a filter matching keyword + chat_id.
-    Returns True if a document was deleted, False otherwise.
-    """
     if global_filter_collection is None:
         logger.error("global_filter_collection not initialized.")
         return False
@@ -186,7 +170,7 @@ async def delete_filter_by_keyword(keyword: str, chat_id) -> bool:
         return False
 
 # ══════════════════════════════════════════════════════════
-#  AUTO REPLY (now async filter loading)
+#  AUTO REPLY (now async filter loading, safe HTML)
 # ══════════════════════════════════════════════════════════
 
 async def auto_reply(update: Update, is_direct: bool = False):
@@ -204,7 +188,6 @@ async def auto_reply(update: Update, is_direct: bool = False):
         chat            = update.effective_chat
         current_chat_id = chat.id if chat.type != "private" else update.effective_user.id
 
-        # ── Cooldown (skip for direct mentions / replies to bot) ──
         if not is_direct:
             now   = time.time()
             state = chat_cooldowns.get(
@@ -221,7 +204,6 @@ async def auto_reply(update: Update, is_direct: bool = False):
                 state["count"]          = 0
             chat_cooldowns[current_chat_id] = state
 
-        # Load filters (async)
         filters_list = await _load_filter_cache(current_chat_id)
         if not filters_list:
             return
@@ -231,6 +213,7 @@ async def auto_reply(update: Update, is_direct: bool = False):
 
         for f in filters_list:
             keyword = f["keyword"].lower()
+            matched = False
 
             if any(ord(c) > 127 for c in keyword):
                 matched = keyword in msg_lower
@@ -243,7 +226,9 @@ async def auto_reply(update: Update, is_direct: bool = False):
                 if f.get("is_sticker"):
                     await update.message.reply_sticker(sticker=f["reply"])
                 else:
-                    await update.message.reply_text(f["reply"])
+                    # HTML injection prevention: escape the stored reply
+                    safe_reply = html_lib.escape(f["reply"])
+                    await update.message.reply_text(safe_reply, parse_mode="HTML")
                 logger.info(f"Auto-reply: '{keyword}' matched in chat {current_chat_id}.")
                 return
 
@@ -339,7 +324,6 @@ async def _generate_filter_list_keyboard(bot, admin_id, page: int,
         if row:
             keyboard.append(row)
 
-        # Pagination
         pag_row     = []
         total_pages = max(1, (total + filters_per_page - 1) // filters_per_page)
         chunk_size  = 5
@@ -385,7 +369,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    # ── FIX: only allow callback from private chat to prevent abuse ──
     if query.message.chat.type != "private":
         await query.answer("This feature is only available in private chat.", show_alert=True)
         return
@@ -396,11 +379,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_ids = get_owner_ids()
 
     try:
-        # ── noop: info-only buttons ─────────────────────────
         if data == "noop":
             return
 
-        # ── Admin page ──────────────────────────────────────
         elif data.startswith("admin|"):
             try:
                 target_admin_id = int(data.split("|", 1)[1])
@@ -413,7 +394,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("❌ Filter များ ဖွင့်၍မရပါ။")
 
-        # ── Pagination ──────────────────────────────────────
         elif data.startswith("page|"):
             parts = data.split("|")
             try:
@@ -429,7 +409,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("❌ Page ဖွင့်၍မရပါ။")
 
-        # ── Home ────────────────────────────────────────────
         elif data == "home":
             markup = await show_dashboard_admin(context.bot, user_id, page=1)
             if markup:
@@ -437,7 +416,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("❌ Dashboard ပြန်ဖွင့်၍မရပါ။")
 
-        # ── Filter detail ───────────────────────────────────
         elif data.startswith("filter_id|"):
             obj_id_str = data.split("filter_id|", 1)[1]
             try:
@@ -486,7 +464,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Filter detail error: {e}")
                 await query.message.reply_text("❌ Filter အသေးစိတ် ဖွင့်ရာတွင် error ဖြစ်ပါသည်။")
 
-        # ── Delete filter ───────────────────────────────────
         elif data.startswith("del_filter|"):
             obj_id_str = data.split("del_filter|", 1)[1]
             try:
@@ -508,7 +485,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Filter <code>{html_lib.escape(fd['keyword'])}</code> ဖျက်ပြီးပါပြီ",
                     parse_mode="HTML"
                 )
-                # Refresh dashboard
                 markup = await show_dashboard_admin(context.bot, user_id, page=1)
                 if markup:
                     await query.message.edit_reply_markup(reply_markup=markup)
@@ -524,12 +500,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ══════════════════════════════════════════════════════════
-#  BROADCAST (async DB reads – OOM & flood fixes)
+#  BROADCAST (memory‑optimized, async)
 # ══════════════════════════════════════════════════════════
-
-def _chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i: i + n]
 
 async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str = "any"):
     if user_collection is None or chat_collection is None:
@@ -537,31 +509,18 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
         return 0, 0
 
     try:
-        # ── FIX: OOM – stream IDs into sets instead of loading full documents ──
-        user_ids = set()
-        async for doc in user_collection.find({}, {"user_id": 1}):
-            user_ids.add(doc["user_id"])
-
-        chat_ids = set()
-        async for doc in chat_collection.find({}, {"chat_id": 1}):
-            cid = doc["chat_id"]
-            if isinstance(cid, int):
-                chat_ids.add(cid)
-
-        # Remove users that are also in chat_ids (no duplicate sending)
-        target_ids = list(user_ids | chat_ids)
-        total = len(target_ids)
+        total_users = await user_collection.count_documents({})
+        total_chats = await chat_collection.count_documents({})
+        total = total_users + total_chats
         if not total:
             logger.warning("Broadcast: no recipients found.")
             return 0, 0
 
-        # ── FIX: reduce concurrency to avoid flood limits ──
         semaphore = asyncio.Semaphore(10)
         sent_count = 0
         user_success = 0
         group_success = 0
 
-        # Notify owners
         progress_msgs = []
         for oid in get_owner_ids():
             try:
@@ -576,7 +535,7 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
             except Exception as e:
                 logger.error(f"Broadcast: progress msg to owner {oid} failed: {e}")
 
-        async def _send(tid):
+        async def _send(tid, is_group=False):
             nonlocal sent_count, user_success, group_success
             async with semaphore:
                 for attempt in range(3):
@@ -585,7 +544,7 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                             chat_id=tid, from_chat_id=from_chat_id,
                             message_id=message_id
                         )
-                        if str(tid).startswith("-"):
+                        if is_group:
                             group_success += 1
                         else:
                             user_success += 1
@@ -595,26 +554,45 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                     except Exception as e:
                         logger.debug(f"Broadcast: failed for {tid}: {e}")
                         break
-                sent_count += 1
-                if sent_count % 50 == 0 or sent_count == total:
-                    pct  = int((sent_count / total) * 100)
-                    fill = int(pct / 10)
-                    bar  = "█" * fill + "░" * (10 - fill)
-                    txt  = (
-                        f"📢 <b>Broadcast လုပ်နေပါသည်...</b>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"[{bar}] {pct}%\n"
-                        f"📨 {sent_count} / {total}"
-                    )
-                    for pm in progress_msgs:
-                        try:
-                            await pm.edit_text(txt, parse_mode="HTML")
-                        except Exception:
-                            pass
-                await asyncio.sleep(0.05)
+            sent_count += 1
+            if sent_count % 50 == 0 or sent_count == total:
+                pct  = int((sent_count / total) * 100)
+                fill = int(pct / 10)
+                bar  = "█" * fill + "░" * (10 - fill)
+                txt  = (
+                    f"📢 <b>Broadcast လုပ်နေပါသည်...</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"[{bar}] {pct}%\n"
+                    f"📨 {sent_count} / {total}"
+                )
+                for pm in progress_msgs:
+                    try:
+                        await pm.edit_text(txt, parse_mode="HTML")
+                    except Exception:
+                        pass
+            await asyncio.sleep(0.05)
 
-        for chunk in _chunks(target_ids, 100):
-            await asyncio.gather(*(_send(tid) for tid in chunk))
+        # Send to users (batch of 100) – streaming directly from cursor
+        batch = []
+        async for doc in user_collection.find({}, {"user_id": 1}):
+            uid = doc["user_id"]
+            batch.append(uid)
+            if len(batch) >= 100:
+                await asyncio.gather(*(_send(uid, False) for uid in batch))
+                batch.clear()
+        if batch:
+            await asyncio.gather(*(_send(uid, False) for uid in batch))
+
+        # Send to chats (batch of 100)
+        batch = []
+        async for doc in chat_collection.find({}, {"chat_id": 1}):
+            cid = doc["chat_id"]
+            batch.append(cid)
+            if len(batch) >= 100:
+                await asyncio.gather(*(_send(cid, True) for cid in batch))
+                batch.clear()
+        if batch:
+            await asyncio.gather(*(_send(cid, True) for cid in batch))
 
         finish = (
             f"✅ <b>Broadcast ပြီးပါပြီ</b>\n"
@@ -638,20 +616,3 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
     except Exception as e:
         logger.error(f"Broadcast unexpected error: {e}")
         return 0, 0
-
-# ══════════════════════════════════════════════════════════
-#  RESET (admin utility, async)
-# ══════════════════════════════════════════════════════════
-
-async def reset_filters():
-    if global_filter_collection is None:
-        logger.error("global_filter_collection not initialized.")
-        return
-    try:
-        result = await global_filter_collection.delete_many({})
-        _invalidate_filter_cache()
-        logger.info(f"All {result.deleted_count} filters deleted.")
-    except PyMongoError as e:
-        logger.error(f"DB error resetting filters: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error resetting filters: {e}")
