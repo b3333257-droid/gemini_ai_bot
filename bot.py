@@ -75,6 +75,7 @@ sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
 
 # Inject → thd.py (init_db will be called later)
+thd.admin_collection = admin_collection   # ← ဒီတစ်ကြောင်း ထည့်ထားပါသည်။
 
 # ── Permission caches ──────────────────────────────────────
 _admin_cache = {}
