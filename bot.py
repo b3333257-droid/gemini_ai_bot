@@ -396,7 +396,7 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_chat.ban_member(target.id)
             await warn_collection.delete_one({"chat_id": update.effective_chat.id, "user_id": target.id})
             await update.message.reply_text(
-                f"🚫 <b>Ban ခံရပြီ</b>  <i>(warn ၃ ကြိမ် ပြည့်)</i>\n"
+                f"🚫 <b>Ban ခံလိုက်ရပါပြီ</b>  <i>(warn ၃ ကြိမ်)</i>\n"
                 f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                 f"👤 {mention}\n"
                 f"🆔 <code>{target.id}</code>\n"
@@ -564,10 +564,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sync_chat_data(update)
     user = update.effective_user
     await update.message.reply_text(
-        f"👋 <b>မင်္ဂလာပါ, {user.first_name}!</b>\n\n"
-        f"ကျွန်တော်သည် group စီမံခန့်ခွဲမှု bot ဖြစ်ပါသည်။\n\n"
+        f"👋 <b>မင်္ဂလာပါရှင့်, {user.first_name}!</b>\n\n"
+        f"Meowက group စီမံခန့်ခွဲမှု bot လေးပါနော်။\n\n"
         f"🔨 Moderation  •  🔎 Filters  •  👋 Greetings\n\n"
-        f"📌 /help — command အားလုံး ကြည့်ရန်",
+        f"📌 /help — command အားလုံး ကြည့်ရန်နှိပ်ပေးပါရှင့်",
         parse_mode="HTML"
     )
 
@@ -703,7 +703,7 @@ async def filter_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 "🛡 <b>Bot Admin Dashboard</b>\n"
                 "━━━━━━━━━━━━━━━\n"
-                "Admin တစ်ယောက်ကို နှိပ်၍ filter များကြည့်ပါ။",
+                "Admin တစ်ယောက်ကို နှိပ်၍ filter များကိုကြည့်ပါ။",
                 reply_markup=markup, parse_mode="HTML"
             )
         else:
