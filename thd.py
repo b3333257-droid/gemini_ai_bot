@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 # ── DB (injected by bot.py) ────────────────────────────────
 welcome_settings_collection = None
+admin_collection            = None   # ← bot.py မှ inject လုပ်မည်
 
 # ── Owner IDs (injected by bot.py) ─────────────────────────
 OWNER_IDS: frozenset = frozenset()
@@ -54,6 +55,17 @@ def get_owner_ids() -> frozenset:
 
 def is_owner(user_id: int) -> bool:
     return user_id in get_owner_ids()
+
+async def is_bot_admin(user_id: int) -> bool:
+    """Bot admin collection မှာ ရှိမရှိ စစ်ဆေး။"""
+    if admin_collection is None:
+        return False
+    try:
+        doc = await admin_collection.find_one({"user_id": user_id})
+        return doc is not None
+    except Exception as e:
+        logger.error(f"is_bot_admin check error: {e}")
+        return False
 
 async def get_welcome_settings(chat_id) -> dict | None:
     """
@@ -147,21 +159,38 @@ async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
     """
     Returns (target_chat_id, scope_label) or (None, "") on permission failure.
     Sends the error reply itself if permission is denied.
+
+    Scope logic (filter system နဲ့ တူညီ):
+      - Owner / Bot admin  → global scope (private chat မှာဖြစ်စေ group မှာဖြစ်စေ)
+      - Group admin/creator (group ထဲမှာ command လုပ်ရင်) → local scope (that group only)
+      - ကျန်သူများ → ပငျဆငျး
     """
     user_id = update.effective_user.id
     chat    = update.effective_chat
 
+    # Private chat မှာ command လုပ်ရင် → global scope (owner / bot admin သာ)
     if chat.type == "private":
-        if not is_owner(user_id):
-            await update.message.reply_text("❌ Owner သာ global setting ပြောင်းနိုင်သည်။")
-            return None, ""
-        return "global", "🌐 Global"
+        if is_owner(user_id) or await is_bot_admin(user_id):
+            return "global", "🌐 Global"
+        await update.message.reply_text("❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။")
+        return None, ""
+
+    # Group မှာ command လုပ်ရင် → scope ခွဲ
     else:
-        member = await chat.get_member(user_id)
-        if member.status not in ("administrator", "creator") and not is_owner(user_id):
-            await update.message.reply_text("❌ Group admin သာ ပြောင်းနိုင်သည်။")
-            return None, ""
-        return chat.id, f"💬 {chat.title}"
+        # Owner / Bot admin → global scope
+        if is_owner(user_id) or await is_bot_admin(user_id):
+            return "global", "🌐 Global"
+
+        # Group admin / creator → local scope (that group only)
+        try:
+            member = await chat.get_member(user_id)
+            if member.status in ("administrator", "creator"):
+                return chat.id, f"💬 {chat.title}"
+        except Exception as e:
+            logger.error(f"_resolve_scope get_member error: {e}")
+
+        await update.message.reply_text("❌ Group admin သာ ပြောင်းနိုင်သည်။")
+        return None, ""
 
 def _get_text_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     """Extract text from reply_to_message or command args. Returns None if empty."""
