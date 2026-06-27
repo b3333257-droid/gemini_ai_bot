@@ -1,4 +1,4 @@
-# sec.py (fully async – all verified issues fixed)
+# sec.py (fixed for Step 2 & Step 4: is_html support)
 import asyncio
 import html as html_lib
 import logging
@@ -61,7 +61,7 @@ def cleanup_chat_cooldowns():
         logger.debug(f"Cooldown: cleaned {len(expired)} entries.")
 
 # ══════════════════════════════════════════════════════════
-#  FILTER CACHE (now async)
+#  FILTER CACHE (now includes is_html field)
 # ══════════════════════════════════════════════════════════
 
 async def _load_filter_cache(chat_id):
@@ -71,7 +71,7 @@ async def _load_filter_cache(chat_id):
     try:
         cursor = global_filter_collection.find(
             {"chat_id": {"$in": [chat_id, "global"]}},
-            {"keyword": 1, "reply": 1, "is_sticker": 1, "_id": 0}
+            {"keyword": 1, "reply": 1, "is_sticker": 1, "is_html": 1, "_id": 0}
         )
         rows = await cursor.to_list(length=None)
         _filter_cache[chat_id]      = rows
@@ -96,12 +96,12 @@ def _invalidate_filter_cache(chat_id=None):
         logger.debug(f"Filter cache: cleared for chat {chat_id}.")
 
 # ══════════════════════════════════════════════════════════
-#  FILTER CRUD (async)
+#  FILTER CRUD (with is_html field)
 # ══════════════════════════════════════════════════════════
 
 async def add_global_filter(keyword: str, reply: str, creator_id: int,
                              creator_name: str, chat_id="global",
-                             is_sticker: bool = False) -> bool:
+                             is_sticker: bool = False, is_html: bool = False) -> bool:
     if global_filter_collection is None:
         logger.error("global_filter_collection not initialized.")
         return False
@@ -131,6 +131,7 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
             "creator_name": creator_name,
             "chat_id":      chat_id,
             "is_sticker":   is_sticker,
+            "is_html":      is_html,          # NEW: store the flag
             "created_at":   datetime.now(timezone.utc),
         }
         await global_filter_collection.update_one(
@@ -139,7 +140,7 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
             upsert=True
         )
         _invalidate_filter_cache(chat_id)
-        logger.info(f"Filter '{cleaned}' saved by {creator_id} in '{chat_id}'.")
+        logger.info(f"Filter '{cleaned}' saved by {creator_id} in '{chat_id}' (is_html={is_html}).")
         return True
     except PyMongoError as e:
         logger.error(f"DB error saving filter '{keyword}': {e}")
@@ -170,7 +171,7 @@ async def delete_filter_by_keyword(keyword: str, chat_id) -> bool:
         return False
 
 # ══════════════════════════════════════════════════════════
-#  AUTO REPLY (now async filter loading, safe HTML)
+#  AUTO REPLY (respects is_html flag)
 # ══════════════════════════════════════════════════════════
 
 async def auto_reply(update: Update, is_direct: bool = False):
@@ -226,9 +227,14 @@ async def auto_reply(update: Update, is_direct: bool = False):
                 if f.get("is_sticker"):
                     await update.message.reply_sticker(sticker=f["reply"])
                 else:
-                    # HTML injection prevention: escape the stored reply
-                    safe_reply = html_lib.escape(f["reply"])
-                    await update.message.reply_text(safe_reply, parse_mode="HTML")
+                    # NEW: respect is_html flag
+                    if f.get("is_html"):
+                        # Already safe HTML, send directly without escaping
+                        await update.message.reply_text(f["reply"], parse_mode="HTML")
+                    else:
+                        # Legacy plain text, escape to prevent injection
+                        safe_reply = html_lib.escape(f["reply"])
+                        await update.message.reply_text(safe_reply, parse_mode="HTML")
                 logger.info(f"Auto-reply: '{keyword}' matched in chat {current_chat_id}.")
                 return
 
@@ -238,7 +244,7 @@ async def auto_reply(update: Update, is_direct: bool = False):
         logger.error(f"Unexpected error in auto_reply: {e}")
 
 # ══════════════════════════════════════════════════════════
-#  DASHBOARD KEYBOARDS (async)
+#  DASHBOARD KEYBOARDS (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def _generate_admin_list_keyboard(bot, page: int, admins_per_page: int = 10):
@@ -361,7 +367,7 @@ async def show_dashboard_admin(bot, user_id, page: int = 1, admin_id=None):
         return None
 
 # ══════════════════════════════════════════════════════════
-#  CALLBACK HANDLER (with abuse prevention)
+#  CALLBACK HANDLER (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,7 +506,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ══════════════════════════════════════════════════════════
-#  BROADCAST (memory‑optimized, async)
+#  BROADCAST (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str = "any"):
