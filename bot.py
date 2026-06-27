@@ -75,7 +75,7 @@ sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
 
 # Inject → thd.py (init_db will be called later)
-thd.admin_collection = admin_collection   # ← ဒီတစ်ကြောင်း ထည့်ထားပါသည်။
+thd.admin_collection = admin_collection
 
 # ── Permission caches ──────────────────────────────────────
 _admin_cache = {}
@@ -572,8 +572,72 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ══════════════════════════════════════════════════════════
+#  ENTITY → HTML HELPER  (NEW)
+# ══════════════════════════════════════════════════════════
+
+def _entities_to_html(text: str, entities: list) -> str:
+    """Convert plain text with Telegram entities to an HTML string,
+    including <tg-emoji> for custom emoji entities."""
+    if not entities:
+        return html.escape(text)  # fallback to plain escape
+
+    # Sort entities by offset (they should already be sorted, but ensure)
+    entities = sorted(entities, key=lambda e: e.offset)
+    result = []
+    last_idx = 0
+    for entity in entities:
+        # Add escaped text before this entity
+        if entity.offset > last_idx:
+            result.append(html.escape(text[last_idx:entity.offset]))
+        # Extract the substring for this entity
+        entity_text = text[entity.offset:entity.offset + entity.length]
+
+        if entity.type == "custom_emoji":
+            # custom_emoji_id is required
+            emoji_id = getattr(entity, "custom_emoji_id", None)
+            if emoji_id:
+                result.append(f'<tg-emoji emoji-id="{emoji_id}">{html.escape(entity_text)}</tg-emoji>')
+            else:
+                # Fallback – just escape
+                result.append(html.escape(entity_text))
+        elif entity.type == "bold":
+            result.append(f"<b>{html.escape(entity_text)}</b>")
+        elif entity.type == "italic":
+            result.append(f"<i>{html.escape(entity_text)}</i>")
+        elif entity.type == "underline":
+            result.append(f"<u>{html.escape(entity_text)}</u>")
+        elif entity.type == "strikethrough":
+            result.append(f"<s>{html.escape(entity_text)}</s>")
+        elif entity.type == "code":
+            result.append(f"<code>{html.escape(entity_text)}</code>")
+        elif entity.type == "pre":
+            # Pre could have language, but we ignore for simplicity
+            result.append(f"<pre>{html.escape(entity_text)}</pre>")
+        elif entity.type == "text_link":
+            url = getattr(entity, "url", "")
+            result.append(f'<a href="{html.escape(url)}">{html.escape(entity_text)}</a>')
+        elif entity.type == "text_mention":
+            user = getattr(entity, "user", None)
+            if user:
+                result.append(f'<a href="tg://user?id={user.id}">{html.escape(entity_text)}</a>')
+            else:
+                result.append(html.escape(entity_text))
+        else:
+            # Unknown entity type – just escape
+            result.append(html.escape(entity_text))
+
+        last_idx = entity.offset + entity.length
+
+    # Add remaining text after last entity
+    if last_idx < len(text):
+        result.append(html.escape(text[last_idx:]))
+    return "".join(result)
+
+# ══════════════════════════════════════════════════════════
 #  FILTER COMMANDS
 # ══════════════════════════════════════════════════════════
+
+import html  # needed for _entities_to_html
 
 async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sync_user_data(update)
@@ -584,6 +648,9 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     filter_keyword       = None
     user_id              = update.effective_user.id
     chat_id              = update.effective_chat.id
+
+    # NEW: is_html flag for storage
+    is_html = False
 
     try:
         if reply_message:
@@ -597,7 +664,20 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 filter_reply_content = reply_message.sticker.file_id
                 is_sticker_filter    = True
             elif reply_message.text:
-                filter_reply_content = reply_message.text
+                # NEW: Check if entities exist → build HTML
+                if reply_message.entities:
+                    filter_reply_content = _entities_to_html(reply_message.text, reply_message.entities)
+                    is_html = True
+                else:
+                    # Plain text, no entities
+                    filter_reply_content = reply_message.text
+            elif reply_message.caption:
+                # For captions (media)
+                if reply_message.caption_entities:
+                    filter_reply_content = _entities_to_html(reply_message.caption, reply_message.caption_entities)
+                    is_html = True
+                else:
+                    filter_reply_content = reply_message.caption
             else:
                 return await update.message.reply_text("❌ Text သို့မဟုတ် Sticker reply သာ ရပါသည်။")
 
@@ -610,6 +690,7 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     parse_mode="HTML"
                 )
             filter_keyword, filter_reply_content = parts[0].strip().lower(), parts[1].strip()
+            # Command-arg based filters are always plain text → is_html=False (default)
 
         else:
             return await update.message.reply_text(
@@ -637,10 +718,12 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             return await update.message.reply_text("❌ Group ထဲမှသာ ထည့်နိုင်သည်။")
 
+        # NEW: pass is_html to sec.add_global_filter
         await sec.add_global_filter(
             keyword=filter_keyword, reply=filter_reply_content,
             creator_id=user_id, creator_name=update.effective_user.first_name,
-            chat_id=final_chat_id, is_sticker=is_sticker_filter
+            chat_id=final_chat_id, is_sticker=is_sticker_filter,
+            is_html=is_html
         )
         msg_type = "🎭 Sticker" if is_sticker_filter else "💬 Text"
         await update.message.reply_text(
