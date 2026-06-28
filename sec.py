@@ -1,4 +1,4 @@
-# sec.py (fixed for Step 2 & Step 4: is_html support)
+# sec.py (Fixed: Local-first filter lookup in auto_reply)
 import asyncio
 import html as html_lib
 import logging
@@ -61,7 +61,7 @@ def cleanup_chat_cooldowns():
         logger.debug(f"Cooldown: cleaned {len(expired)} entries.")
 
 # ══════════════════════════════════════════════════════════
-#  FILTER CACHE (now includes is_html field)
+#  FILTER CACHE (includes is_html field)
 # ══════════════════════════════════════════════════════════
 
 async def _load_filter_cache(chat_id):
@@ -71,7 +71,7 @@ async def _load_filter_cache(chat_id):
     try:
         cursor = global_filter_collection.find(
             {"chat_id": {"$in": [chat_id, "global"]}},
-            {"keyword": 1, "reply": 1, "is_sticker": 1, "is_html": 1, "_id": 0}
+            {"keyword": 1, "reply": 1, "is_sticker": 1, "is_html": 1, "_id": 0, "chat_id": 1}
         )
         rows = await cursor.to_list(length=None)
         _filter_cache[chat_id]      = rows
@@ -131,7 +131,7 @@ async def add_global_filter(keyword: str, reply: str, creator_id: int,
             "creator_name": creator_name,
             "chat_id":      chat_id,
             "is_sticker":   is_sticker,
-            "is_html":      is_html,          # NEW: store the flag
+            "is_html":      is_html,
             "created_at":   datetime.now(timezone.utc),
         }
         await global_filter_collection.update_one(
@@ -171,7 +171,7 @@ async def delete_filter_by_keyword(keyword: str, chat_id) -> bool:
         return False
 
 # ══════════════════════════════════════════════════════════
-#  AUTO REPLY (respects is_html flag)
+#  AUTO REPLY (Local-first lookup order)
 # ══════════════════════════════════════════════════════════
 
 async def auto_reply(update: Update, is_direct: bool = False):
@@ -212,6 +212,9 @@ async def auto_reply(update: Update, is_direct: bool = False):
         msg_lower   = message_text.lower()
         latin_words = set(re.findall(r'\b\w+\b', msg_lower))
 
+        local_matches = []
+        global_matches = []
+
         for f in filters_list:
             keyword = f["keyword"].lower()
             matched = False
@@ -224,19 +227,31 @@ async def auto_reply(update: Update, is_direct: bool = False):
                 matched = keyword in latin_words
 
             if matched:
-                if f.get("is_sticker"):
-                    await update.message.reply_sticker(sticker=f["reply"])
+                # Determine scope
+                if f.get("chat_id") == current_chat_id:
+                    local_matches.append(f)
+                else:  # global (chat_id == "global" or others)
+                    global_matches.append(f)
+
+        # Priority: Local first, then Global
+        chosen = None
+        if local_matches:
+            chosen = local_matches[0]
+        elif global_matches:
+            chosen = global_matches[0]
+
+        if chosen:
+            f = chosen
+            if f.get("is_sticker"):
+                await update.message.reply_sticker(sticker=f["reply"])
+            else:
+                if f.get("is_html"):
+                    await update.message.reply_text(f["reply"], parse_mode="HTML")
                 else:
-                    # NEW: respect is_html flag
-                    if f.get("is_html"):
-                        # Already safe HTML, send directly without escaping
-                        await update.message.reply_text(f["reply"], parse_mode="HTML")
-                    else:
-                        # Legacy plain text, escape to prevent injection
-                        safe_reply = html_lib.escape(f["reply"])
-                        await update.message.reply_text(safe_reply, parse_mode="HTML")
-                logger.info(f"Auto-reply: '{keyword}' matched in chat {current_chat_id}.")
-                return
+                    safe_reply = html_lib.escape(f["reply"])
+                    await update.message.reply_text(safe_reply, parse_mode="HTML")
+            logger.info(f"Auto-reply: '{f['keyword']}' matched in chat {current_chat_id} "
+                        f"(scope: {f.get('chat_id')}).")
 
     except PyMongoError as e:
         logger.error(f"DB error in auto_reply: {e}")
