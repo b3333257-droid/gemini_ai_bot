@@ -1,4 +1,4 @@
-# thd.py (fixed for Steps 1, 5, 6: welcome/goodbye entity support)
+# thd.py (Fixed: _resolve_scope & help_cmd)
 import html as html_lib
 import logging
 import os
@@ -34,12 +34,10 @@ async def init_db(db) -> None:
         raise
 
 # ══════════════════════════════════════════════════════════
-#  ENTITY → HTML HELPER (NEW – duplicated from bot.py logic)
+#  ENTITY → HTML HELPER (unchanged)
 # ══════════════════════════════════════════════════════════
 
 def _entities_to_html(text: str, entities: list) -> str:
-    """Convert plain text with Telegram entities to an HTML string,
-    including <tg-emoji> for custom emoji entities."""
     if not entities:
         return html_lib.escape(text)
 
@@ -98,7 +96,7 @@ def _entities_to_html(text: str, entities: list) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-#  HELPERS (modified)
+#  HELPERS (modified _resolve_scope)
 # ══════════════════════════════════════════════════════════
 
 def get_owner_ids() -> frozenset:
@@ -128,10 +126,6 @@ async def is_bot_admin(user_id: int) -> bool:
         return False
 
 async def get_welcome_settings(chat_id) -> dict | None:
-    """
-    Return settings dict (including entities fields) with field‑wise
-    fallback to global.  Motor requires await for find_one operations.
-    """
     if welcome_settings_collection is None:
         logger.error("welcome_settings_collection not initialized.")
         return None
@@ -142,7 +136,6 @@ async def get_welcome_settings(chat_id) -> dict | None:
         if not local:
             return global_doc
 
-        # Fallback fields: text and entities
         if global_doc:
             for key in ("welcome_text", "goodbye_text",
                         "welcome_entities", "goodbye_entities"):
@@ -161,25 +154,15 @@ async def get_welcome_settings(chat_id) -> dict | None:
 def format_message_with_placeholders(
     text: str, user, chat, entities: list | None = None
 ) -> str:
-    """
-    Replace placeholders in welcome/goodbye text.
-    If `entities` is provided (list of Telegram MessageEntity objects),
-    the message is first converted to HTML using those entities, then
-    placeholders are replaced.  Otherwise the legacy escaping logic is used.
-    """
     if not text:
         return ""
 
     try:
-        # ── 1. Build HTML from text + entities (if any) ─────
         if entities:
-            # entities exist → build full HTML string
             html_message = _entities_to_html(text, entities)
         else:
-            # No entities → legacy: escape the whole template
             html_message = html_lib.escape(text)
 
-        # ── 2. Prepare replacement values (always safe HTML) ─
         user_mention = (
             user.mention_html()
             if hasattr(user, "mention_html")
@@ -204,7 +187,6 @@ def format_message_with_placeholders(
         else:
             gp_text = group_title
 
-        # ── 3. Replace placeholders ──────────────────────────
         html_message = html_message.replace("{name}", user_mention)
         html_message = html_message.replace("{id}", user_id_str)
         html_message = html_message.replace("{group}", group_title)
@@ -221,25 +203,24 @@ def format_message_with_placeholders(
 
 
 # ══════════════════════════════════════════════════════════
-#  PERMISSION GUARD (unchanged)
+#  PERMISSION GUARD (FIXED: Global only from DM)
 # ══════════════════════════════════════════════════════════
 
 async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
     user_id = update.effective_user.id
     chat    = update.effective_chat
 
+    # Private chat တွင် Owner/Admin မှသာ Global ဖန်တီးခွင့်ရှိသည်
     if chat.type == "private":
         if is_owner(user_id) or await is_bot_admin(user_id):
             return "global", "🌐 Global"
-        await update.message.reply_text(
-            "❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။"
-        )
-        return None, ""
+        else:
+            await update.message.reply_text("❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။")
+            return None, ""
 
+    # Group / Supergroup တွင် မည်သူမဆို (Owner/Admin အပါအဝင်) Local သာရမည်
+    # သို့သော် Group Admin / Creator မဟုတ်ပါက လုံးဝခွင့်မပြုပါ
     else:
-        if is_owner(user_id) or await is_bot_admin(user_id):
-            return "global", "🌐 Global"
-
         try:
             member = await chat.get_member(user_id)
             if member.status in ("administrator", "creator"):
@@ -254,10 +235,6 @@ async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
 # ── Updated text extractor ──────────────────────────────────
 
 def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Extract text AND entities from reply or command args.
-    Returns (text, entities_list_or_None).  Returns (None, None) if empty.
-    """
     if update.message.reply_to_message:
         reply = update.message.reply_to_message
         if reply.text:
@@ -270,7 +247,7 @@ def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════
-#  SETWELCOME / SETGOODBYE (updated to store entities)
+#  SETWELCOME / SETGOODBYE (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -290,16 +267,13 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode="HTML"
             )
 
-        # Build the $set data – entities may be None
         set_data = {
             "welcome_text": text,
             "updated_at": datetime.now(timezone.utc),
         }
         if entities is not None:
-            # Convert entities to serialisable dict list (MongoDB will store as array of objects)
             set_data["welcome_entities"] = [e.to_dict() for e in entities]
         else:
-            # If no entities, ensure the field is removed (if it existed before)
             await welcome_settings_collection.update_one(
                 {"chat_id": target_chat_id},
                 {"$unset": {"welcome_entities": ""}}
@@ -377,7 +351,7 @@ async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ══════════════════════════════════════════════════════════
-#  DELWELCOME / DELGOODBYE (also clear entities)
+#  DELWELCOME / DELGOODBYE (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def del_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,7 +421,7 @@ async def del_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ══════════════════════════════════════════════════════════
-#  HELP (unchanged)
+#  HELP (UPDATED: new command names)
 # ══════════════════════════════════════════════════════════
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -486,10 +460,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         "👋 <b>Greetings</b>\n"
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        "/setwelcome  —  Welcome message သတ်မှတ်ရန်\n"
-        "/setgoodbye  —  Goodbye message သတ်မှတ်ရန်\n"
-        "/delwelcome  —  Welcome message ဖျက်ရန်\n"
-        "/delgoodbye  —  Goodbye message ဖျက်ရန်\n\n"
+        "/setwel   —  Welcome message သတ်မှတ်ရန်\n"
+        "/setbye   —  Goodbye message သတ်မှတ်ရန်\n"
+        "/delwel   —  Welcome message ဖျက်ရန်\n"
+        "/delbye   —  Goodbye message ဖျက်ရန်\n\n"
 
         "💡 <b>Placeholders:</b> <code>{name}</code>  <code>{id}</code>  "
         "<code>{group}</code>  <code>(@)</code>"
@@ -501,7 +475,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════════════════
-#  MEMBER STATUS HANDLER (updated to pass entities)
+#  MEMBER STATUS HANDLER (unchanged)
 # ══════════════════════════════════════════════════════════
 
 async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -514,7 +488,6 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat = update.effective_chat
 
-    # ── Welcome ─────────────────────────────────────────────
     if new.status == "member" and old.status in ("left", "kicked"):
         user = new.user
         if getattr(user, "is_bot", False):
@@ -522,12 +495,8 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
         settings = await get_welcome_settings(chat.id)
         if settings and "welcome_text" in settings:
             try:
-                entities = settings.get("welcome_entities")  # list of dicts or None
-                # Convert stored dicts back to entity objects if needed? We'll
-                # keep them as plain dicts – `_entities_to_html` expects objects
-                # with .type, .offset, .length etc.  We'll need to convert them.
+                entities = settings.get("welcome_entities")
                 if entities:
-                    # Reconstruct MessageEntity-like objects
                     from telegram import MessageEntity
                     entities = [
                         MessageEntity(
@@ -547,7 +516,6 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"Welcome message error: {e}")
 
-    # ── Goodbye ─────────────────────────────────────────────
     elif old.status in ("member", "administrator") and new.status in ("left", "kicked"):
         user = old.user
         if getattr(user, "is_bot", False):
