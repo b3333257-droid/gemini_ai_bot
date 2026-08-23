@@ -4,20 +4,20 @@ import logging
 import os
 from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
-from telegram import Update
+from telegram import Update, MessageEntity, User
 from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
 # ── DB (injected by bot.py) ────────────────────────────────
 welcome_settings_collection = None
-admin_collection            = None   # ← bot.py မှ inject လုပ်မည်
+admin_collection            = None
 
 # ── Owner IDs (injected by bot.py) ─────────────────────────
 OWNER_IDS: frozenset = frozenset()
 
 # ══════════════════════════════════════════════════════════
-#  INIT (unchanged)
+#  INIT
 # ══════════════════════════════════════════════════════════
 
 async def init_db(db) -> None:
@@ -34,7 +34,7 @@ async def init_db(db) -> None:
         raise
 
 # ══════════════════════════════════════════════════════════
-#  ENTITY → HTML HELPER (unchanged)
+#  ENTITY → HTML HELPER
 # ══════════════════════════════════════════════════════════
 
 def _entities_to_html(text: str, entities: list) -> str:
@@ -94,9 +94,25 @@ def _entities_to_html(text: str, entities: list) -> str:
         result.append(html_lib.escape(text[last_idx:]))
     return "".join(result)
 
+def _dict_to_message_entities(entities):
+    """Convert entity dicts (from DB) back into MessageEntity objects."""
+    if not entities:
+        return None
+    result = []
+    for e in entities:
+        kwargs = {k: v for k, v in e.items() if k not in ("type", "offset", "length")}
+        if "user" in kwargs and isinstance(kwargs["user"], dict):
+            kwargs["user"] = User(**kwargs["user"])
+        result.append(MessageEntity(
+            type=e["type"],
+            offset=e["offset"],
+            length=e["length"],
+            **kwargs
+        ))
+    return result
 
 # ══════════════════════════════════════════════════════════
-#  HELPERS (modified _resolve_scope)
+#  HELPERS
 # ══════════════════════════════════════════════════════════
 
 def get_owner_ids() -> frozenset:
@@ -150,7 +166,6 @@ async def get_welcome_settings(chat_id) -> dict | None:
         logger.error(f"Unexpected error fetching welcome settings: {e}")
         return None
 
-
 def format_message_with_placeholders(
     text: str, user, chat, entities: list | None = None
 ) -> str:
@@ -201,16 +216,14 @@ def format_message_with_placeholders(
         logger.error(f"format_message_with_placeholders error: {e}")
         return text
 
-
 # ══════════════════════════════════════════════════════════
-#  PERMISSION GUARD (FIXED: Global only from DM)
+#  PERMISSION GUARD
 # ══════════════════════════════════════════════════════════
 
 async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
     user_id = update.effective_user.id
     chat    = update.effective_chat
 
-    # Private chat တွင် Owner/Admin မှသာ Global ဖန်တီးခွင့်ရှိသည်
     if chat.type == "private":
         if is_owner(user_id) or await is_bot_admin(user_id):
             return "global", "🌐 Global"
@@ -218,8 +231,6 @@ async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
             await update.message.reply_text("❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။")
             return None, ""
 
-    # Group / Supergroup တွင် မည်သူမဆို (Owner/Admin အပါအဝင်) Local သာရမည်
-    # သို့သော် Group Admin / Creator မဟုတ်ပါက လုံးဝခွင့်မပြုပါ
     else:
         try:
             member = await chat.get_member(user_id)
@@ -230,9 +241,6 @@ async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
 
         await update.message.reply_text("❌ Group admin သာ ပြောင်းနိုင်သည်။")
         return None, ""
-
-
-# ── Updated text extractor ──────────────────────────────────
 
 def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
@@ -245,9 +253,8 @@ def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     joined = " ".join(context.args) if context.args else ""
     return (joined, None) if joined.strip() else (None, None)
 
-
 # ══════════════════════════════════════════════════════════
-#  SETWELCOME / SETGOODBYE (unchanged)
+#  SETWELCOME / SETGOODBYE
 # ══════════════════════════════════════════════════════════
 
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -299,7 +306,6 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"set_welcome error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
-
 async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
         return await update.message.reply_text("❌ Database ချိတ်ဆက်မှု မရှိပါ။")
@@ -349,9 +355,8 @@ async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"set_goodbye error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
-
 # ══════════════════════════════════════════════════════════
-#  DELWELCOME / DELGOODBYE (unchanged)
+#  DELWELCOME / DELGOODBYE
 # ══════════════════════════════════════════════════════════
 
 async def del_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,7 +391,6 @@ async def del_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"del_welcome error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
-
 async def del_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
         return await update.message.reply_text("❌ Database ချိတ်ဆက်မှု မရှိပါ။")
@@ -419,9 +423,8 @@ async def del_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"del_goodbye error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
-
 # ══════════════════════════════════════════════════════════
-#  HELP (UPDATED: new command names)
+#  HELP
 # ══════════════════════════════════════════════════════════
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -473,9 +476,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"help_cmd error: {e}")
 
-
 # ══════════════════════════════════════════════════════════
-#  MEMBER STATUS HANDLER (unchanged)
+#  MEMBER STATUS HANDLER
 # ══════════════════════════════════════════════════════════
 
 async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,16 +499,7 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 entities = settings.get("welcome_entities")
                 if entities:
-                    from telegram import MessageEntity
-                    entities = [
-                        MessageEntity(
-                            type=e["type"],
-                            offset=e["offset"],
-                            length=e["length"],
-                            **{k: v for k, v in e.items() if k not in ("type", "offset", "length")}
-                        )
-                        for e in entities
-                    ]
+                    entities = _dict_to_message_entities(entities)
                 msg = format_message_with_placeholders(
                     settings["welcome_text"], user, chat, entities=entities
                 )
@@ -525,16 +518,7 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 entities = settings.get("goodbye_entities")
                 if entities:
-                    from telegram import MessageEntity
-                    entities = [
-                        MessageEntity(
-                            type=e["type"],
-                            offset=e["offset"],
-                            length=e["length"],
-                            **{k: v for k, v in e.items() if k not in ("type", "offset", "length")}
-                        )
-                        for e in entities
-                    ]
+                    entities = _dict_to_message_entities(entities)
                 msg = format_message_with_placeholders(
                     settings["goodbye_text"], user, chat, entities=entities
                 )
