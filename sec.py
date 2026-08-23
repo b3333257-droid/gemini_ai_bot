@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 global_filter_collection = None
 user_collection          = None
 chat_collection          = None
+admin_collection         = None
 
 # ── Owner IDs (injected by bot.py) ─────────────────────────
 OWNER_IDS: frozenset = frozenset()
@@ -46,6 +47,15 @@ def get_owner_ids() -> frozenset:
         except (ValueError, TypeError):
             pass
     return frozenset(ids)
+
+async def is_bot_admin(user_id: int) -> bool:
+    if admin_collection is None:
+        return False
+    try:
+        return await admin_collection.find_one({"user_id": user_id}) is not None
+    except Exception as e:
+        logger.error(f"is_bot_admin check error: {e}")
+        return False
 
 # ══════════════════════════════════════════════════════════
 #  COOLDOWN
@@ -227,13 +237,11 @@ async def auto_reply(update: Update, is_direct: bool = False):
                 matched = keyword in latin_words
 
             if matched:
-                # Determine scope
                 if f.get("chat_id") == current_chat_id:
                     local_matches.append(f)
-                else:  # global (chat_id == "global" or others)
+                else:
                     global_matches.append(f)
 
-        # Priority: Local first, then Global
         chosen = None
         if local_matches:
             chosen = local_matches[0]
@@ -259,7 +267,7 @@ async def auto_reply(update: Update, is_direct: bool = False):
         logger.error(f"Unexpected error in auto_reply: {e}")
 
 # ══════════════════════════════════════════════════════════
-#  DASHBOARD KEYBOARDS (unchanged)
+#  DASHBOARD KEYBOARDS
 # ══════════════════════════════════════════════════════════
 
 async def _generate_admin_list_keyboard(bot, page: int, admins_per_page: int = 10):
@@ -311,7 +319,6 @@ async def _generate_admin_list_keyboard(bot, page: int, admins_per_page: int = 1
     except Exception as e:
         logger.error(f"Unexpected error generating admin list: {e}")
         return InlineKeyboardMarkup([])
-
 
 async def _generate_filter_list_keyboard(bot, admin_id, page: int,
                                           filters_per_page: int = 15):
@@ -370,7 +377,6 @@ async def _generate_filter_list_keyboard(bot, admin_id, page: int,
         logger.error(f"Unexpected error generating filter list: {e}")
         return InlineKeyboardMarkup([])
 
-
 async def show_dashboard_admin(bot, user_id, page: int = 1, admin_id=None):
     try:
         if not admin_id or admin_id == 0:
@@ -382,7 +388,7 @@ async def show_dashboard_admin(bot, user_id, page: int = 1, admin_id=None):
         return None
 
 # ══════════════════════════════════════════════════════════
-#  CALLBACK HANDLER (unchanged)
+#  CALLBACK HANDLER (with access control)
 # ══════════════════════════════════════════════════════════
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,10 +400,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("This feature is only available in private chat.", show_alert=True)
         return
 
-    await query.answer()
     data      = query.data or ""
     user_id   = query.from_user.id
     owner_ids = get_owner_ids()
+
+    if not (user_id in owner_ids or await is_bot_admin(user_id)):
+        await query.answer("❌ ခွင့်ပြုချက် မရှိပါ။", show_alert=True)
+        return
+
+    await query.answer()
 
     try:
         if data == "noop":
@@ -521,13 +532,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ══════════════════════════════════════════════════════════
-#  BROADCAST (unchanged)
+#  BROADCAST
 # ══════════════════════════════════════════════════════════
 
 async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str = "any"):
     if user_collection is None or chat_collection is None:
         logger.error("Collections not initialized for broadcast.")
-        return 0, 0
+        return {"total_users": 0, "total_chats": 0,
+                "user_success": 0, "group_success": 0,
+                "user_failed": 0, "group_failed": 0}
 
     try:
         total_users = await user_collection.count_documents({})
@@ -535,12 +548,16 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
         total = total_users + total_chats
         if not total:
             logger.warning("Broadcast: no recipients found.")
-            return 0, 0
+            return {"total_users": 0, "total_chats": 0,
+                    "user_success": 0, "group_success": 0,
+                    "user_failed": 0, "group_failed": 0}
 
         semaphore = asyncio.Semaphore(10)
-        sent_count = 0
-        user_success = 0
+        sent_count    = 0
+        user_success  = 0
         group_success = 0
+        user_failed   = 0
+        group_failed  = 0
 
         progress_msgs = []
         for oid in get_owner_ids():
@@ -557,7 +574,8 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                 logger.error(f"Broadcast: progress msg to owner {oid} failed: {e}")
 
         async def _send(tid, is_group=False):
-            nonlocal sent_count, user_success, group_success
+            nonlocal sent_count, user_success, group_success, user_failed, group_failed
+            success = False
             async with semaphore:
                 for attempt in range(3):
                     try:
@@ -569,12 +587,18 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                             group_success += 1
                         else:
                             user_success += 1
+                        success = True
                         break
                     except RetryAfter as e:
                         await asyncio.sleep(e.retry_after)
                     except Exception as e:
                         logger.debug(f"Broadcast: failed for {tid}: {e}")
                         break
+            if not success:
+                if is_group:
+                    group_failed += 1
+                else:
+                    user_failed += 1
             sent_count += 1
             if sent_count % 50 == 0 or sent_count == total:
                 pct  = int((sent_count / total) * 100)
@@ -593,22 +617,18 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                         pass
             await asyncio.sleep(0.05)
 
-        # Send to users (batch of 100) – streaming directly from cursor
         batch = []
         async for doc in user_collection.find({}, {"user_id": 1}):
-            uid = doc["user_id"]
-            batch.append(uid)
+            batch.append(doc["user_id"])
             if len(batch) >= 100:
                 await asyncio.gather(*(_send(uid, False) for uid in batch))
                 batch.clear()
         if batch:
             await asyncio.gather(*(_send(uid, False) for uid in batch))
 
-        # Send to chats (batch of 100)
         batch = []
         async for doc in chat_collection.find({}, {"chat_id": 1}):
-            cid = doc["chat_id"]
-            batch.append(cid)
+            batch.append(doc["chat_id"])
             if len(batch) >= 100:
                 await asyncio.gather(*(_send(cid, True) for cid in batch))
                 batch.clear()
@@ -618,9 +638,9 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
         finish = (
             f"✅ <b>Broadcast ပြီးပါပြီ</b>\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📨 စုစုပေါင်း: <b>{user_success + group_success}</b>\n\n"
-            f"👤 Users: <b>{user_success}</b>\n"
-            f"👥 Groups: <b>{group_success}</b>"
+            f"📨 ပို့ပြီး: <b>{user_success + group_success}</b> / <b>{total}</b>\n\n"
+            f"👤 Users: <b>{user_success}</b> / {total_users} (failed {user_failed})\n"
+            f"👥 Groups: <b>{group_success}</b> / {total_chats} (failed {group_failed})"
         )
         for pm in progress_msgs:
             try:
@@ -628,12 +648,24 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
             except Exception:
                 pass
 
-        logger.info(f"Broadcast done: {user_success} users, {group_success} groups.")
-        return user_success, group_success
+        logger.info(f"Broadcast done: {user_success} users ({user_failed} failed), "
+                    f"{group_success} groups ({group_failed} failed).")
+        return {
+            "total_users": total_users,
+            "total_chats": total_chats,
+            "user_success": user_success,
+            "group_success": group_success,
+            "user_failed": user_failed,
+            "group_failed": group_failed,
+        }
 
     except PyMongoError as e:
         logger.error(f"Broadcast DB error: {e}")
-        return 0, 0
+        return {"total_users": 0, "total_chats": 0,
+                "user_success": 0, "group_success": 0,
+                "user_failed": 0, "group_failed": 0}
     except Exception as e:
         logger.error(f"Broadcast unexpected error: {e}")
-        return 0, 0
+        return {"total_users": 0, "total_chats": 0,
+                "user_success": 0, "group_success": 0,
+                "user_failed": 0, "group_failed": 0}
