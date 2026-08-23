@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import logging
+import html
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -73,9 +74,11 @@ sec.user_collection          = user_collection
 sec.chat_collection          = chat_collection
 sec.filters_col              = global_filter_collection
 sec.OWNER_IDS                = Config.OWNER_IDS
+sec.admin_collection         = admin_collection
 
-# Inject → thd.py (init_db will be called later)
+# Inject → thd.py
 thd.admin_collection = admin_collection
+thd.OWNER_IDS        = Config.OWNER_IDS
 
 # ── Permission caches ──────────────────────────────────────
 _admin_cache = {}
@@ -131,6 +134,7 @@ async def check_hierarchy(chat, issuer_id: int, target_id: int):
             return "❌ Admin အချင်းချင်း အရေးယူ၍မရပါ။"
     except Exception as e:
         logger.error(f"Hierarchy check error: {e}")
+        return "⚠️ Hierarchy စစ်ဆေးမှု မအောင်မြင်ပါ။"
     return None
 
 class UserData:
@@ -251,7 +255,13 @@ def cache_cleaner_task():
         except Exception as e:
             logger.error(f"Cache cleaner error: {e}")
 
-MUTE_PERMISSIONS = ChatPermissions(can_send_messages=False)
+MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_media_messages=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
 
 # ══════════════════════════════════════════════════════════
 #  MODERATION
@@ -350,6 +360,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat         = update.effective_chat
         default_perms = chat.permissions or ChatPermissions(
             can_send_messages=True,
+            can_send_media_messages=True,
             can_send_polls=True,
             can_send_other_messages=True,
             can_add_web_page_previews=True,
@@ -638,8 +649,6 @@ def _entities_to_html(text: str, entities: list) -> str:
 #  FILTER COMMANDS
 # ══════════════════════════════════════════════════════════
 
-import html
-
 async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await sync_user_data(update)
     await sync_chat_data(update)
@@ -698,18 +707,14 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not filter_keyword or not filter_reply_content:
             return await update.message.reply_text("❌ Keyword သို့မဟုတ် reply ဗလာဖြစ်နေပါသည်။")
 
-        # ── NEW SCOPE LOGIC (FILTER) ───────────────────────────
         final_chat_id = None
         scope_message = ""
         chat_type = update.effective_chat.type
 
-        # Private chat တွင် Owner/Admin မှသာ Global filter ဖန်တီးခွင့်ရှိသည်
         if chat_type == "private" and (is_owner(user_id) or await is_admin(user_id)):
             final_chat_id = "global"
             scope_message = "🌐 Global"
-        # Group / Supergroup တွင် Owner/Admin အပါအဝင် အားလုံး Local သာရမည်
         elif chat_type in ["group", "supergroup"]:
-            # Group admin / creator ဖြစ်မှသာ ထည့်ခွင့်ရှိသည် (Local)
             member = await update.effective_chat.get_member(user_id)
             if member.status in ["administrator", "creator"]:
                 final_chat_id = chat_id
@@ -718,8 +723,6 @@ async def add_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 return await update.message.reply_text("❌ Group admin သာ local filter ထည့်နိုင်သည်။")
         else:
             return await update.message.reply_text("❌ ဒီ chat အမျိုးအစားတွင် filter ထည့်၍မရပါ။")
-
-        # ── END NEW SCOPE LOGIC ────────────────────────────────
 
         await sec.add_global_filter(
             keyword=filter_keyword, reply=filter_reply_content,
@@ -805,17 +808,20 @@ async def broadcast_post_command(update: Update, context: ContextTypes.DEFAULT_T
         return await update.message.reply_text("❌ Broadcast လုပ်မည့် message ကို reply လုပ်ပါ။")
     try:
         msg = update.message.reply_to_message
-        user_success, group_success = await sec.smart_post(
+        stats = await sec.smart_post(
             msg.message_id, content_type="any",
             bot=context.bot, from_chat_id=update.effective_chat.id
         )
-        total = user_success + group_success
+        total   = stats["total_users"] + stats["total_chats"]
+        success = stats["user_success"] + stats["group_success"]
         await update.message.reply_text(
             f"📢 <b>Broadcast ပြီးပါပြီ</b>\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"✅ စုစုပေါင်း: <b>{total}</b>\n\n"
-            f"👤 Users: <b>{user_success}</b>\n"
-            f"👥 Groups: <b>{group_success}</b>",
+            f"📨 ပို့ပြီး: <b>{success}</b> / <b>{total}</b>\n\n"
+            f"👤 Users: <b>{stats['user_success']}</b> / {stats['total_users']} "
+            f"(failed {stats['user_failed']})\n"
+            f"👥 Groups: <b>{stats['group_success']}</b> / {stats['total_chats']} "
+            f"(failed {stats['group_failed']})",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -873,11 +879,10 @@ def register_all_handlers(application):
         ("delfilter",  del_filter_command),
         ("filterlist", filter_list_command),
         ("post",       broadcast_post_command),
-        # ── RENAMED COMMANDS ───────────────────────────
-        ("setwel",     thd.set_welcome),   # was setwelcome
-        ("delwel",     thd.del_welcome),   # was delwelcome
-        ("setbye",     thd.set_goodbye),   # was setgoodbye
-        ("delbye",     thd.del_goodbye),   # was delgoodbye
+        ("setwel",     thd.set_welcome),
+        ("delwel",     thd.del_welcome),
+        ("setbye",     thd.set_goodbye),
+        ("delbye",     thd.del_goodbye),
     ]
     for cmd, handler in commands:
         application.add_handler(CommandHandler(cmd, handler))
@@ -966,29 +971,23 @@ async def main():
     application = Application.builder().token(Config.TOKEN).build()
     register_all_handlers(application)
 
-    # Start background threads
     threading.Thread(target=run_flask_app,       daemon=True).start()
     threading.Thread(target=self_ping_task,       daemon=True).start()
     threading.Thread(target=cache_cleaner_task,   daemon=True).start()
 
-    # Start the prune scheduler as a task so we can cancel it on shutdown
     prune_task = asyncio.create_task(auto_prune_scheduler())
 
-    # Initialize and start the bot application
     await application.initialize()
     await application.start()
 
     logger.info("Bot polling စတင်ပါပြီ...")
     await application.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
 
-    # Wait until the application stops (e.g. by signal)
-    # We'll just run forever until the process is interrupted
     try:
-        await asyncio.Event().wait()  # block until cancelled
+        await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
 
-    # Graceful shutdown
     prune_task.cancel()
     try:
         await prune_task
