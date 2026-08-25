@@ -5,11 +5,12 @@ import threading
 import time
 import logging
 import html
+import re
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-from telegram import Update, ChatPermissions
+from telegram import Update, ChatPermissions, MessageEntity
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -260,6 +261,12 @@ MUTE_PERMISSIONS = ChatPermissions(
     can_send_polls=False,
     can_send_other_messages=False,
     can_add_web_page_previews=False,
+)
+
+# ── Anti-Spam Link Blocker ────────────────────────────────
+URL_PATTERN = re.compile(
+    r'(?:https?://|www\.)[^\s]+|t\.me/[^\s]+|telegram\.me/[^\s]+|telegram\.dog/[^\s]+',
+    re.IGNORECASE
 )
 
 # ══════════════════════════════════════════════════════════
@@ -856,6 +863,90 @@ async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Auto-reply error: {e}")
 
 # ══════════════════════════════════════════════════════════
+#  ANTI-SPAM LINK BLOCKER
+# ══════════════════════════════════════════════════════════
+
+async def anti_spam_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Group check only
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        return
+    
+    # 2. Must have a user (not channel post without user)
+    user = update.effective_user
+    if not user or user.id == context.bot.id:
+        return
+    
+    # 3. Admin exemption
+    if is_owner(user.id) or await is_admin(user.id) or await is_group_admin(update, user.id):
+        return
+    
+    # 4. Link detection
+    text = (update.message.text or update.message.caption or "").strip()
+    has_link = False
+    
+    # Check entities (URL, TEXT_LINK only — NO MENTION)
+    entities = update.message.entities or update.message.caption_entities or []
+    for entity in entities:
+        if entity.type in (MessageEntity.URL, MessageEntity.TEXT_LINK):
+            has_link = True
+            break
+    
+    # Regex fallback for raw links Telegram didn't entity-ize
+    if not has_link and URL_PATTERN.search(text):
+        has_link = True
+    
+    if not has_link:
+        return
+    
+    # 5. Delete the spam message
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.error(f"Anti-spam delete error ({chat.id}): {e}")
+        return
+    
+    # 6. Auto-warn + ban logic (reuse existing warn_collection)
+    try:
+        warn_data = await warn_collection.find_one_and_update(
+            {"chat_id": chat.id, "user_id": user.id},
+            {
+                "$inc": {"count": 1},
+                "$setOnInsert": {"chat_id": chat.id, "user_id": user.id}
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+        current = warn_data.get("count", 1) if warn_data else 1
+        
+        if current >= 3:
+            await chat.ban_member(user.id)
+            await warn_collection.delete_one({"chat_id": chat.id, "user_id": user.id})
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"🚫 <b>Spam Link = Ban</b>\n"
+                     f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                     f"👤 {user.mention_html()}\n"
+                     f"🆔 <code>{user.id}</code>\n"
+                     f"📊 Warns: 🟥🟥🟥 3/3\n"
+                     f"💡 Link ပို့လို့ warn ၃ကြိမ်ပြည့်သွားပါပြီ",
+                parse_mode="HTML"
+            )
+        else:
+            bar = "🟥" * current + "⬜" * (3 - current)
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"⚠️ <b>Link ပို့ခြင်း မလုပ်ရပါ</b>\n"
+                     f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                     f"👤 {user.mention_html()}\n"
+                     f"📊 Warns: {bar} {current}/3\n"
+                     f"💡 Admin မဟုတ်ရင် link မပို့ရပါ (warn ၃ကြိမ် = ban)",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Anti-spam warn error ({chat.id}): {e}")
+
+# ══════════════════════════════════════════════════════════
 #  HANDLER REGISTRATION
 # ══════════════════════════════════════════════════════════
 
@@ -885,6 +976,13 @@ def register_all_handlers(application):
     for cmd, handler in commands:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(ChatMemberHandler(thd.member_status_handler, ChatMemberHandler.CHAT_MEMBER))
+    
+    # Anti-spam handler registered with group=-1 (higher priority)
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.CAPTION) & filters.ChatType.GROUPS & ~filters.COMMAND,
+        anti_spam_handler
+    ), group=-1)
+    
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
         auto_reply_handler
