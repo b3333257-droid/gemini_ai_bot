@@ -1,8 +1,10 @@
-# fou.py — /info and /stats
+# fou.py — /info and /stats  (centered headers, monospace-safe)
 import asyncio
 import html as html_lib
 import logging
+import re
 import time
+import unicodedata
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update
@@ -24,11 +26,80 @@ welcome_settings_collection = None
 OWNER_IDS      = frozenset()
 BOT_START_TIME = 0.0
 
-# Injected helper functions
-_is_owner                 = None   # sync  (user_id) -> bool
-_is_bot_admin             = None   # async (user_id) -> bool
-_is_group_admin           = None   # async (update, user_id) -> bool
-_get_cached_group_admins  = None   # sync  (chat_id) -> frozenset | None
+_is_owner                 = None
+_is_bot_admin             = None
+_is_group_admin           = None
+_get_cached_group_admins  = None
+
+# ══════════════════════════════════════════════════════════
+#  VISUAL WIDTH  (emoji = 2 cols, CJK = 2 cols)
+# ══════════════════════════════════════════════════════════
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001F2FF"
+    "\U0001F300-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\u2B00-\u2BFF"
+    "\u2190-\u21FF"
+    "\u2300-\u23FF"
+    "\u25A0-\u25FF"
+    "\u2600-\u26FF"
+    "]"
+)
+
+
+def _vis_width(s: str) -> int:
+    """Visual column width — emoji & wide chars = 2, others = 1."""
+    w = 0
+    for ch in s:
+        if _EMOJI_RE.match(ch):
+            w += 2
+        elif unicodedata.east_asian_width(ch) in ("W", "F"):
+            w += 2
+        elif ch == "\uFE0F":     # variation selector — 0 width
+            continue
+        else:
+            w += 1
+    return w
+
+
+def _center_plain(text: str, width: int) -> str:
+    """Return text padded with spaces to be visually centered in `width` cols."""
+    vis  = _vis_width(text)
+    pad  = max(0, width - vis)
+    left = pad // 2
+    right = pad - left
+    return (" " * left) + text + (" " * right)
+
+
+BOX_INNER = 22   # characters between ╔ and ╗
+
+
+def _header_box(title: str, emoji: str = "") -> str:
+    """3-line box, monospace-safe, wrapped in <pre>."""
+    content = f"{emoji}  {title}".strip() if emoji else title
+    line    = _center_plain(content, BOX_INNER)
+    bar     = "═" * BOX_INNER
+    return (
+        "<pre>"
+        f"╔{bar}╗\n"
+        f"║{line}║\n"
+        f"╚{bar}╝"
+        "</pre>"
+    )
+
+
+def _section_title(emoji: str, title: str, width: int = BOX_INNER) -> str:
+    """Centered bold section title (no box)."""
+    content = f"{emoji}  {title}"
+    vis     = _vis_width(content)
+    pad     = max(0, width - vis)
+    left    = pad // 2
+    right   = pad - left
+    return (" " * left) + f"<b>{content}</b>" + (" " * right)
+
 
 # ══════════════════════════════════════════════════════════
 #  MESSAGE COUNT BUFFER
@@ -45,14 +116,12 @@ def init_flush_lock():
 
 
 def bump_message_count(user_id: int) -> None:
-    """Sync — increment in-memory counter. Flushed by flush_loop()."""
     if not user_id:
         return
     _msg_buffer[user_id] = _msg_buffer.get(user_id, 0) + 1
 
 
 async def flush_message_counts() -> int:
-    """Write buffered counts to DB. Returns number of users flushed."""
     global _msg_buffer
     if not _msg_buffer:
         return 0
@@ -77,7 +146,6 @@ async def flush_message_counts() -> int:
 
 
 async def flush_loop():
-    """Background task — flush every FLUSH_INTERVAL seconds."""
     while True:
         try:
             await asyncio.sleep(FLUSH_INTERVAL)
@@ -93,7 +161,7 @@ async def flush_loop():
 
 
 # ══════════════════════════════════════════════════════════
-#  SAFE API WRAPPERS  — never raise
+#  SAFE API WRAPPERS
 # ══════════════════════════════════════════════════════════
 async def _safe_get_member(chat, user_id):
     try:
@@ -112,7 +180,6 @@ async def _safe_get_member_count(chat):
 
 
 async def _safe_resolve_chat(bot, identifier):
-    """identifier = int | str(username). Returns Chat/User or None."""
     try:
         if isinstance(identifier, int):
             return await bot.get_chat(identifier)
@@ -182,7 +249,6 @@ def _profile_link(user_id: int, display: str) -> str:
 
 
 class _UserStub:
-    """Minimal User-like object for DB-only records."""
     def __init__(self, row):
         self.id            = row.get("user_id")
         self.first_name    = row.get("first_name")
@@ -204,7 +270,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller = update.effective_user
 
     try:
-        # Caller's permission level
         caller_is_admin = False
         try:
             caller_is_admin = (
@@ -217,17 +282,14 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = msg.reply_to_message
 
-        # Case 1: reply → channel message
         if reply and reply.sender_chat and not reply.from_user:
             return await _show_channel_info(msg, reply.sender_chat)
 
-        # Case 2: reply → user message
         if reply and reply.from_user:
             return await _show_user_info(
                 msg, reply.from_user, chat, caller, caller_is_admin
             )
 
-        # Case 3: /info @username  |  /info 12345
         args = context.args or []
         if args:
             ident    = args[0]
@@ -238,7 +300,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await _show_user_info(
                     msg, resolved, chat, caller, caller_is_admin
                 )
-            # Fallback: DB lookup
             row = None
             try:
                 if ident.lstrip("-").isdigit():
@@ -253,11 +314,9 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return await msg.reply_text("❌ User ရှာမတွေ့ပါ။")
 
-        # Case 4: private chat, no arg → self
         if chat.type == "private":
             return await _show_user_info(msg, caller, chat, caller, caller_is_admin)
 
-        # Case 5: group chat, no arg → chat info
         return await _show_chat_info(msg, chat)
 
     except Exception as e:
@@ -269,7 +328,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _collect_user_info(user, chat) -> dict:
-    """Gather fields. Never raises."""
     info = {
         "id":              getattr(user, "id", None),
         "first_name":      getattr(user, "first_name", None),
@@ -297,13 +355,11 @@ async def _collect_user_info(user, chat) -> dict:
     except Exception:
         pass
 
-    # Group admin (live check, target's actual status)
     if chat and chat.type != "private":
         member = await _safe_get_member(chat, user.id)
         if member and member.status in ("administrator", "creator"):
             info["is_group_admin"] = True
 
-    # Warn count (per current chat)
     if warn_collection is not None and chat and chat.type != "private":
         try:
             wdoc = await warn_collection.find_one(
@@ -314,7 +370,6 @@ async def _collect_user_info(user, chat) -> dict:
         except Exception as e:
             logger.debug(f"warn lookup failed: {e}")
 
-    # DB fields
     try:
         urow = await user_collection.find_one(
             {"user_id": user.id},
@@ -326,7 +381,6 @@ async def _collect_user_info(user, chat) -> dict:
     except Exception as e:
         logger.debug(f"user db lookup failed: {e}")
 
-    # Joined at (per chat)
     if chat and chat.type != "private" and chat_member_collection is not None:
         try:
             crow = await chat_member_collection.find_one(
@@ -351,9 +405,8 @@ def _render_user_info(info: dict, is_self: bool, viewer_is_admin: bool,
     name = name or "—"
 
     lines = []
-    lines.append("╔══════════════════════╗")
-    lines.append("   👤  <b>User Info</b>")
-    lines.append("╚══════════════════════╝\n")
+    lines.append(_header_box("User Info", "👤"))
+    lines.append("")
     lines.append(f"🆔 ID: <code>{user_id}</code>")
     lines.append(f"📛 Name: {_profile_link(user_id, name)}")
     if info.get("username"):
@@ -370,7 +423,7 @@ def _render_user_info(info: dict, is_self: bool, viewer_is_admin: bool,
 
     if show_private:
         lines.append("")
-        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
         if chat_type != "private":
             lines.append(f"⚠️ Warns (this chat): <b>{info.get('warn_count', 0)}/3</b>")
         lines.append(f"🛡 Bot Admin: {'✅' if info.get('is_bot_admin') else '❌'}")
@@ -387,9 +440,9 @@ def _render_user_info(info: dict, is_self: bool, viewer_is_admin: bool,
 
 async def _show_user_info(msg, user, chat, caller, viewer_is_admin: bool):
     try:
-        info     = await _collect_user_info(user, chat)
-        is_self  = (info.get("id") == getattr(caller, "id", None))
-        text     = _render_user_info(info, is_self, viewer_is_admin, chat.type)
+        info    = await _collect_user_info(user, chat)
+        is_self = (info.get("id") == getattr(caller, "id", None))
+        text    = _render_user_info(info, is_self, viewer_is_admin, chat.type)
         await msg.reply_text(
             text, parse_mode="HTML", disable_web_page_preview=True
         )
@@ -404,9 +457,8 @@ async def _show_user_info(msg, user, chat, caller, viewer_is_admin: bool):
 async def _show_channel_info(msg, channel):
     try:
         lines = []
-        lines.append("╔══════════════════════╗")
-        lines.append("   📢  <b>Channel Info</b>")
-        lines.append("╚══════════════════════╝\n")
+        lines.append(_header_box("Channel Info", "📢"))
+        lines.append("")
         lines.append(f"🆔 ID: <code>{channel.id}</code>")
         if getattr(channel, "title", None):
             lines.append(f"📛 Title: {_esc(channel.title)}")
@@ -424,9 +476,8 @@ async def _show_channel_info(msg, channel):
 async def _show_chat_info(msg, chat):
     try:
         lines = []
-        lines.append("╔══════════════════════╗")
-        lines.append("   💬  <b>Chat Info</b>")
-        lines.append("╚══════════════════════╝\n")
+        lines.append(_header_box("Chat Info", "💬"))
+        lines.append("")
         lines.append(f"🆔 ID: <code>{chat.id}</code>")
         if chat.title:
             lines.append(f"📛 Title: {_esc(chat.title)}")
@@ -434,14 +485,12 @@ async def _show_chat_info(msg, chat):
         if getattr(chat, "username", None):
             lines.append(f"🔗 Username: @{_esc(chat.username)}")
 
-        # Member count (1 API call)
         mc = await _safe_get_member_count(chat)
         if mc is not None:
             lines.append(f"👥 Members: <b>{mc:,}</b>")
         else:
             lines.append("👥 Members: <i>N/A</i>")
 
-        # Admin count — prefer cache
         admin_count = None
         cached = None
         if _get_cached_group_admins is not None:
@@ -460,7 +509,6 @@ async def _show_chat_info(msg, chat):
         if admin_count is not None:
             lines.append(f"👮 Admins: <b>{admin_count}</b>")
 
-        # Filter count
         if global_filter_collection is not None:
             try:
                 fc = await global_filter_collection.count_documents({"chat_id": chat.id})
@@ -468,7 +516,6 @@ async def _show_chat_info(msg, chat):
             except Exception:
                 pass
 
-        # Greetings set?
         if welcome_settings_collection is not None:
             try:
                 w = await welcome_settings_collection.find_one({"chat_id": chat.id})
@@ -489,7 +536,7 @@ async def _show_chat_info(msg, chat):
 
 
 # ══════════════════════════════════════════════════════════
-#  /stats
+#  /stats  — full monospace, clean alignment
 # ══════════════════════════════════════════════════════════
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -540,34 +587,60 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         uptime = time.time() - (BOT_START_TIME or time.time())
 
-        lines = []
-        lines.append("╔══════════════════════╗")
-        lines.append("   📊  <b>Bot Statistics</b>")
-        lines.append("╚══════════════════════╝\n")
-        lines.append(f"⏱ Uptime: <b>{_fmt_uptime(uptime)}</b>\n")
+        # Build full monospace body for perfect alignment
+        W = BOX_INNER
+        bar = "─" * W
 
-        lines.append("<b>👥 Users</b>")
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append(f"   Total:        <b>{total_users:,}</b>")
-        lines.append(f"   Active (7d):  <b>{active_users:,}</b>\n")
+        def sec(emoji, title):
+            # section header inside pre-style: centered on monospace width
+            content = f"{emoji} {title}"
+            vis     = _vis_width(content)
+            pad     = max(0, W - vis)
+            left    = pad // 2
+            right   = pad - left
+            return (" " * left) + content + (" " * right)
 
-        lines.append("<b>👥 Groups</b>")
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append(f"   Total:        <b>{total_groups:,}</b>")
-        lines.append(f"   Active (7d):  <b>{active_groups:,}</b>\n")
+        def row(label: str, value: str, label_w: int = 16) -> str:
+            # left-pad 3, then label, then pad, then value (right-aligned)
+            lbl_vis = _vis_width(label)
+            space   = max(1, label_w - lbl_vis)
+            return f"   {label}{' ' * space}{value}"
 
-        lines.append("<b>🔎 Filters</b>")
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append(f"   Total:        <b>{total_filters:,}</b>")
-        lines.append(f"   Global:       <b>{global_filters:,}</b>\n")
+        body_lines = []
+        body_lines.append(f"╔{'═' * W}╗")
+        body_lines.append(f"║{_center_plain('📊  Bot Statistics', W)}║")
+        body_lines.append(f"╚{'═' * W}╝")
+        body_lines.append("")
+        body_lines.append(f"⏱  Uptime: {_fmt_uptime(uptime)}")
+        body_lines.append("")
+        body_lines.append(bar)
+        body_lines.append(sec("👥", "Users"))
+        body_lines.append(bar)
+        body_lines.append(row("Total",         f"{total_users:,}"))
+        body_lines.append(row("Active (7d)",   f"{active_users:,}"))
+        body_lines.append("")
+        body_lines.append(bar)
+        body_lines.append(sec("👥", "Groups"))
+        body_lines.append(bar)
+        body_lines.append(row("Total",         f"{total_groups:,}"))
+        body_lines.append(row("Active (7d)",   f"{active_groups:,}"))
+        body_lines.append("")
+        body_lines.append(bar)
+        body_lines.append(sec("🔎", "Filters"))
+        body_lines.append(bar)
+        body_lines.append(row("Total",         f"{total_filters:,}"))
+        body_lines.append(row("Global",        f"{global_filters:,}"))
+        body_lines.append("")
+        body_lines.append(bar)
+        body_lines.append(sec("🛡", "Moderation"))
+        body_lines.append(bar)
+        body_lines.append(row("Bot Admins",    f"{total_admins:,}"))
+        body_lines.append(row("Total Warns",   f"{total_warns:,}"))
 
-        lines.append("<b>🛡 Moderation</b>")
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append(f"   Bot Admins:   <b>{total_admins:,}</b>")
-        lines.append(f"   Total Warns:  <b>{total_warns:,}</b>")
+        body = "\n".join(body_lines)
 
         await update.message.reply_text(
-            "\n".join(lines),
+            f"<pre>{body}</pre>",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
