@@ -1,4 +1,4 @@
-# thd.py (Fixed: _resolve_scope & help_cmd)
+# thd.py — Welcome / Goodbye + member tracking
 import html as html_lib
 import logging
 import os
@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 # ── DB (injected by bot.py) ────────────────────────────────
 welcome_settings_collection = None
 admin_collection            = None
+chat_member_collection      = None      # 🆕 injected by bot.py
 
 # ── Owner IDs (injected by bot.py) ─────────────────────────
 OWNER_IDS: frozenset = frozenset()
@@ -19,7 +20,6 @@ OWNER_IDS: frozenset = frozenset()
 # ══════════════════════════════════════════════════════════
 #  INIT
 # ══════════════════════════════════════════════════════════
-
 async def init_db(db) -> None:
     global welcome_settings_collection
     try:
@@ -33,16 +33,16 @@ async def init_db(db) -> None:
         logger.critical(f"thd.py init_db unexpected error: {e}")
         raise
 
-# ══════════════════════════════════════════════════════════
-#  ENTITY → HTML HELPER
-# ══════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════
+#  ENTITY → HTML
+# ══════════════════════════════════════════════════════════
 def _entities_to_html(text: str, entities: list) -> str:
     if not entities:
         return html_lib.escape(text)
 
     entities = sorted(entities, key=lambda e: e.offset)
-    result = []
+    result   = []
     last_idx = 0
     for entity in entities:
         if entity.offset > last_idx:
@@ -94,8 +94,8 @@ def _entities_to_html(text: str, entities: list) -> str:
         result.append(html_lib.escape(text[last_idx:]))
     return "".join(result)
 
+
 def _dict_to_message_entities(entities):
-    """Convert entity dicts (from DB) back into MessageEntity objects."""
     if not entities:
         return None
     result = []
@@ -111,10 +111,10 @@ def _dict_to_message_entities(entities):
         ))
     return result
 
+
 # ══════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════
-
 def get_owner_ids() -> frozenset:
     if OWNER_IDS:
         return OWNER_IDS
@@ -128,8 +128,10 @@ def get_owner_ids() -> frozenset:
             pass
     return frozenset(ids)
 
+
 def is_owner(user_id: int) -> bool:
     return user_id in get_owner_ids()
+
 
 async def is_bot_admin(user_id: int) -> bool:
     if admin_collection is None:
@@ -141,12 +143,13 @@ async def is_bot_admin(user_id: int) -> bool:
         logger.error(f"is_bot_admin check error: {e}")
         return False
 
+
 async def get_welcome_settings(chat_id) -> dict | None:
     if welcome_settings_collection is None:
         logger.error("welcome_settings_collection not initialized.")
         return None
     try:
-        local = await welcome_settings_collection.find_one({"chat_id": chat_id})
+        local      = await welcome_settings_collection.find_one({"chat_id": chat_id})
         global_doc = await welcome_settings_collection.find_one({"chat_id": "global"})
 
         if not local:
@@ -166,9 +169,9 @@ async def get_welcome_settings(chat_id) -> dict | None:
         logger.error(f"Unexpected error fetching welcome settings: {e}")
         return None
 
-def format_message_with_placeholders(
-    text: str, user, chat, entities: list | None = None
-) -> str:
+
+def format_message_with_placeholders(text: str, user, chat,
+                                      entities: list | None = None) -> str:
     if not text:
         return ""
 
@@ -183,16 +186,15 @@ def format_message_with_placeholders(
             if hasattr(user, "mention_html")
             else html_lib.escape(getattr(user, "full_name", "") or "")
         )
-        user_id_str = str(user.id)
-
-        group_title = html_lib.escape(str(chat.title)) if chat.title else ""
+        user_id_str  = str(user.id)
+        group_title  = html_lib.escape(str(chat.title)) if chat.title else ""
 
         username = getattr(user, "username", None)
         if username:
             at_html = f'<a href="tg://user?id={user.id}">@{username}</a>'
         else:
             first_name = getattr(user, "first_name", "") or ""
-            at_html = (
+            at_html    = (
                 f'<a href="tg://user?id={user.id}">'
                 f'{html_lib.escape(first_name)}</a>'
             )
@@ -216,10 +218,10 @@ def format_message_with_placeholders(
         logger.error(f"format_message_with_placeholders error: {e}")
         return text
 
+
 # ══════════════════════════════════════════════════════════
 #  PERMISSION GUARD
 # ══════════════════════════════════════════════════════════
-
 async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
     user_id = update.effective_user.id
     chat    = update.effective_chat
@@ -227,20 +229,19 @@ async def _resolve_scope(update: Update) -> tuple[str | int | None, str]:
     if chat.type == "private":
         if is_owner(user_id) or await is_bot_admin(user_id):
             return "global", "🌐 Global"
-        else:
-            await update.message.reply_text("❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။")
-            return None, ""
-
-    else:
-        try:
-            member = await chat.get_member(user_id)
-            if member.status in ("administrator", "creator"):
-                return chat.id, f"💬 {chat.title}"
-        except Exception as e:
-            logger.error(f"_resolve_scope get_member error: {e}")
-
-        await update.message.reply_text("❌ Group admin သာ ပြောင်းနိုင်သည်။")
+        await update.message.reply_text("❌ Bot admin / owner သာ global setting ပြောင်းနိုင်သည်။")
         return None, ""
+
+    try:
+        member = await chat.get_member(user_id)
+        if member.status in ("administrator", "creator"):
+            return chat.id, f"💬 {chat.title}"
+    except Exception as e:
+        logger.error(f"_resolve_scope get_member error: {e}")
+
+    await update.message.reply_text("❌ Group admin သာ ပြောင်းနိုင်သည်။")
+    return None, ""
+
 
 def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
@@ -253,10 +254,10 @@ def _get_text_and_entities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     joined = " ".join(context.args) if context.args else ""
     return (joined, None) if joined.strip() else (None, None)
 
+
 # ══════════════════════════════════════════════════════════
 #  SETWELCOME / SETGOODBYE
 # ══════════════════════════════════════════════════════════
-
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
         return await update.message.reply_text("❌ Database ချိတ်ဆက်မှု မရှိပါ။")
@@ -276,7 +277,7 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         set_data = {
             "welcome_text": text,
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at":   datetime.now(timezone.utc),
         }
         if entities is not None:
             set_data["welcome_entities"] = [e.to_dict() for e in entities]
@@ -306,6 +307,7 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"set_welcome error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
+
 async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
         return await update.message.reply_text("❌ Database ချိတ်ဆက်မှု မရှိပါ။")
@@ -325,7 +327,7 @@ async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         set_data = {
             "goodbye_text": text,
-            "updated_at": datetime.now(timezone.utc),
+            "updated_at":   datetime.now(timezone.utc),
         }
         if entities is not None:
             set_data["goodbye_entities"] = [e.to_dict() for e in entities]
@@ -355,10 +357,10 @@ async def set_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"set_goodbye error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
+
 # ══════════════════════════════════════════════════════════
 #  DELWELCOME / DELGOODBYE
 # ══════════════════════════════════════════════════════════
-
 async def del_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
         return await update.message.reply_text("❌ Database ချိတ်ဆက်မှု မရှိပါ။")
@@ -390,6 +392,7 @@ async def del_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         logger.error(f"del_welcome error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
+
 
 async def del_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if welcome_settings_collection is None:
@@ -423,10 +426,10 @@ async def del_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"del_goodbye error: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
+
 # ══════════════════════════════════════════════════════════
 #  HELP
 # ══════════════════════════════════════════════════════════
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
         "╔══════════════════╗\n"
@@ -436,7 +439,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👤 <b>General</b>\n"
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         "/start   —  Bot စတင်ရန်\n"
-        "/help    —  Command စာရင်းကြည့်ရန်\n\n"
+        "/help    —  Command စာရင်းကြည့်ရန်\n"
+        "/info    —  User/Chat အချက်အလက်\n"
+        "/stats   —  Bot statistics <i>(admin only)</i>\n\n"
 
         "🔨 <b>Moderation</b>\n"
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
@@ -476,22 +481,37 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"help_cmd error: {e}")
 
-# ══════════════════════════════════════════════════════════
-#  MEMBER STATUS HANDLER
-# ══════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════
+#  MEMBER STATUS HANDLER  (+ chat_member tracking)
+# ══════════════════════════════════════════════════════════
 async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.chat_member:
         return
-    new = update.chat_member.new_chat_member
-    old = update.chat_member.old_chat_member
+    new  = update.chat_member.new_chat_member
+    old  = update.chat_member.old_chat_member
     if new is None or old is None:
         return
 
     chat = update.effective_chat
 
+    # ─── JOIN ───
     if new.status == "member" and old.status in ("left", "kicked"):
         user = new.user
+        # Track join (non-bot only)
+        if not getattr(user, "is_bot", False) and chat_member_collection is not None:
+            try:
+                await chat_member_collection.update_one(
+                    {"chat_id": chat.id, "user_id": user.id},
+                    {"$set": {
+                        "joined_at": datetime.now(timezone.utc),
+                        "left_at":   None,
+                    }},
+                    upsert=True
+                )
+            except Exception as e:
+                logger.error(f"track join error ({chat.id}/{user.id}): {e}")
+
         if getattr(user, "is_bot", False):
             return
         settings = await get_welcome_settings(chat.id)
@@ -509,8 +529,20 @@ async def member_status_handler(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"Welcome message error: {e}")
 
+    # ─── LEAVE ───
     elif old.status in ("member", "administrator") and new.status in ("left", "kicked"):
         user = old.user
+        # Track leave (non-bot only)
+        if not getattr(user, "is_bot", False) and chat_member_collection is not None:
+            try:
+                await chat_member_collection.update_one(
+                    {"chat_id": chat.id, "user_id": user.id},
+                    {"$set": {"left_at": datetime.now(timezone.utc)}},
+                    upsert=True
+                )
+            except Exception as e:
+                logger.error(f"track leave error ({chat.id}/{user.id}): {e}")
+
         if getattr(user, "is_bot", False):
             return
         settings = await get_welcome_settings(chat.id)
