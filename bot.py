@@ -1,4 +1,5 @@
-# bot.py
+# bot.py — Optimized anti-spam rewrite
+# Compatible with sec.py / thd.py (all injections preserved)
 import asyncio
 import os
 import threading
@@ -18,7 +19,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ChatMemberHandler
+    ChatMemberHandler,
+    ApplicationHandlerStop,
 )
 
 import sec
@@ -82,20 +84,47 @@ thd.admin_collection = admin_collection
 thd.OWNER_IDS        = Config.OWNER_IDS
 
 # ── Permission caches ──────────────────────────────────────
-_admin_cache = {}
-_group_admin_cache = {}
+# Bot-admin set cache (replaces old positive-only _admin_cache)
+_bot_admin_ids       = frozenset()
+_bot_admin_ids_time  = 0.0
+_bot_admin_ids_lock  = asyncio.Lock()
+BOT_ADMIN_IDS_TTL    = 300  # 5 minutes
 
+_group_admin_cache   = {}
+GROUP_ADMIN_TTL      = 1800  # 30 minutes
+
+# ── Owner / Admin helpers ──────────────────────────────────
 def is_owner(user_id: int) -> bool:
     return user_id in Config.OWNER_IDS
 
-async def is_admin(user_id: int) -> bool:
+def invalidate_bot_admin_cache():
+    """Force next get_bot_admin_ids() call to re-query the DB."""
+    global _bot_admin_ids_time
+    _bot_admin_ids_time = 0.0
+
+async def get_bot_admin_ids() -> frozenset:
+    """Return cached frozenset of all bot-admin user IDs.
+    One DB round-trip per TTL window, then O(1) membership tests."""
+    global _bot_admin_ids, _bot_admin_ids_time
     now = time.time()
-    if user_id in _admin_cache and now - _admin_cache[user_id] < 300:
-        return True
-    if await admin_collection.find_one({"user_id": user_id}):
-        _admin_cache[user_id] = now
-        return True
-    return False
+    if _bot_admin_ids and (now - _bot_admin_ids_time) < BOT_ADMIN_IDS_TTL:
+        return _bot_admin_ids
+    async with _bot_admin_ids_lock:
+        # Double-check after lock acquisition (thundering-herd guard)
+        now = time.time()
+        if _bot_admin_ids and (now - _bot_admin_ids_time) < BOT_ADMIN_IDS_TTL:
+            return _bot_admin_ids
+        try:
+            rows = await admin_collection.find({}, {"user_id": 1}).to_list(length=None)
+            _bot_admin_ids      = frozenset(r["user_id"] for r in rows)
+            _bot_admin_ids_time = now
+        except Exception as e:
+            logger.error(f"get_bot_admin_ids error: {e}")
+        return _bot_admin_ids
+
+async def is_admin(user_id: int) -> bool:
+    """Bot-admin check via cached frozenset — no DB hit after warmup."""
+    return user_id in await get_bot_admin_ids()
 
 async def is_group_admin(update: Update, user_id: int) -> bool:
     chat = update.effective_chat
@@ -106,9 +135,9 @@ async def is_group_admin(update: Update, user_id: int) -> bool:
     if entry and now < entry["expires"]:
         return user_id in entry["admins"]
     try:
-        admins   = await chat.get_administrators()
+        admins    = await chat.get_administrators()
         admin_ids = frozenset(a.user.id for a in admins)
-        _group_admin_cache[chat.id] = {"admins": admin_ids, "expires": now + 300}
+        _group_admin_cache[chat.id] = {"admins": admin_ids, "expires": now + GROUP_ADMIN_TTL}
         return user_id in admin_ids
     except Exception as e:
         logger.error(f"Group admin စစ်ဆေးမှု error ({chat.id}): {e}")
@@ -138,11 +167,20 @@ async def check_hierarchy(chat, issuer_id: int, target_id: int):
         return "⚠️ Hierarchy စစ်ဆေးမှု မအောင်မြင်ပါ။"
     return None
 
+# ── User helpers ───────────────────────────────────────────
 class UserData:
     def __init__(self, user_id: int, username=None, first_name="Unknown"):
         self.id         = user_id
         self.username   = username
         self.first_name = first_name
+
+def _profile_mention(user) -> str:
+    """HTML mention ALWAYS linked via tg://user?id= — click → profile."""
+    if getattr(user, "username", None):
+        display = f"@{user.username}"
+    else:
+        display = getattr(user, "first_name", None) or "User"
+    return f'<a href="tg://user?id={user.id}">{html.escape(display)}</a>'
 
 async def get_user_mention(bot, user_id: int) -> str:
     try:
@@ -154,7 +192,7 @@ async def get_user_mention(bot, user_id: int) -> str:
             if row.get("username"):
                 return f"@{row['username']}"
             name = row.get("first_name", "Unknown")
-            return f'<a href="tg://user?id={user_id}">{name}</a>'
+            return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
         return str(user_id)
 
 async def get_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,8 +277,6 @@ def cleanup_caches():
     for cache in (user_sync_cache, chat_sync_cache):
         for k in [k for k, v in cache.items() if now - v > 7200]:
             del cache[k]
-    for k in [k for k, v in _admin_cache.items() if now - v > 600]:
-        del _admin_cache[k]
     for cid in [c for c, e in _group_admin_cache.items() if now > e["expires"]]:
         del _group_admin_cache[cid]
     try:
@@ -363,7 +399,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         return await update.message.reply_text(err)
     try:
-        chat         = update.effective_chat
+        chat          = update.effective_chat
         default_perms = chat.permissions or ChatPermissions(
             can_send_messages=True,
             can_send_polls=True,
@@ -512,7 +548,7 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       "added_at": datetime.now(timezone.utc)}},
             upsert=True
         )
-        _admin_cache[target.id] = time.time()
+        invalidate_bot_admin_cache()
         mention = await get_user_mention(context.bot, target.id)
         await update.message.reply_text(
             f"🛡 <b>Bot Admin ထည့်ပြီးပါပြီ</b>\n"
@@ -534,7 +570,7 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ Owner ကို ဖယ်ရှား၍မရပါ။")
     try:
         await admin_collection.delete_one({"user_id": target.id})
-        _admin_cache.pop(target.id, None)
+        invalidate_bot_admin_cache()
         mention = await get_user_mention(context.bot, target.id)
         await update.message.reply_text(
             f"🗑 <b>Bot Admin ဖယ်ရှားပြီးပါပြီ</b>\n"
@@ -863,88 +899,87 @@ async def auto_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Auto-reply error: {e}")
 
 # ══════════════════════════════════════════════════════════
-#  ANTI-SPAM LINK BLOCKER
+#  ANTI-SPAM LINK BLOCKER  (Optimized, notice-only)
 # ══════════════════════════════════════════════════════════
 
 async def anti_spam_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1. Group check only
+    """
+    Delete link messages instantly, send a notice with profile-linked mention.
+    No warn, no ban. Admin-exempt. Runs in group=-1 so it fires before auto-reply.
+
+    Performance path:
+      1. Group check       (0 API / 0 DB)
+      2. Link detect       (0 API / 0 DB — regex + entity only)
+      3. Owner check       (0 API / 0 DB — frozenset)
+      4. Bot-admin check   (0 DB after TTL warmup — frozenset)
+      5. Group-admin check (0 API after TTL warmup — dict cache)
+      6. Delete + notice   (2 API calls total)
+    """
+    # ── 1. Group only ──
     chat = update.effective_chat
     if not chat or chat.type == "private":
         return
-    
-    # 2. Must have a user (not channel post without user)
+
+    msg = update.message
+    if not msg:
+        return
+
+    # Anonymous admin posts (sender_chat == the group itself) → skip
+    if msg.sender_chat and msg.sender_chat.id == chat.id:
+        return
+
     user = update.effective_user
     if not user or user.id == context.bot.id:
         return
-    
-    # 3. Admin exemption
-    if is_owner(user.id) or await is_admin(user.id) or await is_group_admin(update, user.id):
-        return
-    
-    # 4. Link detection
-    text = (update.message.text or update.message.caption or "").strip()
+
+    # ── 2. Link detection FIRST (cheapest, no I/O) ──
+    text = (msg.text or msg.caption or "").strip()
     has_link = False
-    
-    # Check entities (URL, TEXT_LINK only — NO MENTION)
-    entities = update.message.entities or update.message.caption_entities or []
-    for entity in entities:
-        if entity.type in (MessageEntity.URL, MessageEntity.TEXT_LINK):
+    entities = msg.entities or msg.caption_entities or []
+    for e in entities:
+        if e.type in (MessageEntity.URL, MessageEntity.TEXT_LINK):
             has_link = True
             break
-    
-    # Regex fallback for raw links Telegram didn't entity-ize
     if not has_link and URL_PATTERN.search(text):
         has_link = True
-    
     if not has_link:
         return
-    
-    # 5. Delete the spam message
+
+    # ── 3. Admin exemption — all in-memory ──
+    if is_owner(user.id):
+        return
+    if user.id in await get_bot_admin_ids():
+        return
+    if await is_group_admin(update, user.id):
+        return
+
+    # ── 4. Delete IMMEDIATELY ──
     try:
-        await update.message.delete()
+        await msg.delete()
     except Exception as e:
         logger.error(f"Anti-spam delete error ({chat.id}): {e}")
-        return
-    
-    # 6. Auto-warn + ban logic (reuse existing warn_collection)
+        # Can't delete → don't spam notice either
+        raise ApplicationHandlerStop
+
+    # ── 5. Notice — profile-linked mention, no warn/ban ──
     try:
-        warn_data = await warn_collection.find_one_and_update(
-            {"chat_id": chat.id, "user_id": user.id},
-            {
-                "$inc": {"count": 1},
-                "$setOnInsert": {"chat_id": chat.id, "user_id": user.id}
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER
+        mention = _profile_mention(user)
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"⚠️ <b>Link ပို့ခွင့် မပြုပါ</b>\n"
+                f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                f"👤 {mention}\n"
+                f"💡 ဤ group တွင် link များ ပို့ခွင့်မပြုပါ။"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
-        current = warn_data.get("count", 1) if warn_data else 1
-        
-        if current >= 3:
-            await chat.ban_member(user.id)
-            await warn_collection.delete_one({"chat_id": chat.id, "user_id": user.id})
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"🚫 <b>Spam Link = Ban</b>\n"
-                     f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                     f"👤 {user.mention_html()}\n"
-                     f"🆔 <code>{user.id}</code>\n"
-                     f"📊 Warns: 🟥🟥🟥 3/3\n"
-                     f"💡 Link ပို့လို့ warn ၃ကြိမ်ပြည့်သွားပါပြီ",
-                parse_mode="HTML"
-            )
-        else:
-            bar = "🟥" * current + "⬜" * (3 - current)
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"⚠️ <b>Link ပို့ခြင်း မလုပ်ရပါ</b>\n"
-                     f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-                     f"👤 {user.mention_html()}\n"
-                     f"📊 Warns: {bar} {current}/3\n"
-                     f"💡 Admin မဟုတ်ရင် link မပို့ရပါ (warn ၃ကြိမ် = ban)",
-                parse_mode="HTML"
-            )
     except Exception as e:
-        logger.error(f"Anti-spam warn error ({chat.id}): {e}")
+        logger.error(f"Anti-spam notice error ({chat.id}): {e}")
+
+    # Stop further handlers (auto-reply, etc.) from processing this deleted message
+    raise ApplicationHandlerStop
 
 # ══════════════════════════════════════════════════════════
 #  HANDLER REGISTRATION
@@ -976,17 +1011,19 @@ def register_all_handlers(application):
     for cmd, handler in commands:
         application.add_handler(CommandHandler(cmd, handler))
     application.add_handler(ChatMemberHandler(thd.member_status_handler, ChatMemberHandler.CHAT_MEMBER))
-    
-    # Anti-spam handler registered with group=-1 (higher priority)
+
+    # Anti-spam: HIGHER priority (group=-1). Fires before auto-reply.
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & filters.ChatType.GROUPS & ~filters.COMMAND,
         anti_spam_handler
     ), group=-1)
-    
+
+    # Auto-reply / filters / math
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
         auto_reply_handler
     ))
+
     application.add_handler(CallbackQueryHandler(sec.handle_callback))
     logger.info("Handler အားလုံး မှတ်ပုံတင်ပြီးပါပြီ။")
 
@@ -1067,9 +1104,9 @@ async def main():
     application = Application.builder().token(Config.TOKEN).build()
     register_all_handlers(application)
 
-    threading.Thread(target=run_flask_app,       daemon=True).start()
-    threading.Thread(target=self_ping_task,       daemon=True).start()
-    threading.Thread(target=cache_cleaner_task,   daemon=True).start()
+    threading.Thread(target=run_flask_app,     daemon=True).start()
+    threading.Thread(target=self_ping_task,    daemon=True).start()
+    threading.Thread(target=cache_cleaner_task, daemon=True).start()
 
     prune_task = asyncio.create_task(auto_prune_scheduler())
 
@@ -1077,7 +1114,9 @@ async def main():
     await application.start()
 
     logger.info("Bot polling စတင်ပါပြီ...")
-    await application.updater.start_polling(allowed_updates=["message", "callback_query", "chat_member"])
+    await application.updater.start_polling(
+        allowed_updates=["message", "edited_message", "callback_query", "chat_member"]
+    )
 
     try:
         await asyncio.Event().wait()
