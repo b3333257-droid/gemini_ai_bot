@@ -1,4 +1,4 @@
-# sec.py (Fixed: Local-first filter lookup in auto_reply)
+# sec.py (Forward-first broadcast + local-first filter lookup)
 import asyncio
 import html as html_lib
 import logging
@@ -532,15 +532,75 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ══════════════════════════════════════════════════════════
-#  BROADCAST
+#  BROADCAST  (Forward-first, Copy fallback)
 # ══════════════════════════════════════════════════════════
 
+async def _deliver_one(bot, tid: int, from_chat_id: int, message_id: int) -> bool:
+    """
+    Deliver one message via forward_message (primary), copy_message (fallback).
+    Returns True on success, False on failure.
+    """
+    # ── Try forward first (preserves channel source → drives views) ──
+    try:
+        await bot.forward_message(
+            chat_id=tid,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+        )
+        return True
+    except RetryAfter as e:
+        # Rate-limited on forward — wait once and retry forward
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.forward_message(
+                chat_id=tid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+            return True
+        except Exception as e2:
+            logger.debug(f"Forward retry failed for {tid}: {e2}")
+    except Exception as e:
+        logger.debug(f"Forward failed for {tid}: {e}")
+
+    # ── Fallback: copy_message ──
+    try:
+        await bot.copy_message(
+            chat_id=tid,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+        )
+        return True
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            await bot.copy_message(
+                chat_id=tid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+            return True
+        except Exception as e2:
+            logger.debug(f"Copy retry failed for {tid}: {e2}")
+            return False
+    except Exception as e:
+        logger.debug(f"Copy failed for {tid}: {e}")
+        return False
+
+
 async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str = "any"):
+    """
+    Broadcast a message to all users + groups.
+    Primary method: forward (so views go to original channel).
+    Fallback: copy (for content-protected / forward-disabled sources).
+    """
+    empty = {"total_users": 0, "total_chats": 0,
+             "user_success": 0, "group_success": 0,
+             "user_failed": 0, "group_failed": 0}
+
     if user_collection is None or chat_collection is None:
         logger.error("Collections not initialized for broadcast.")
-        return {"total_users": 0, "total_chats": 0,
-                "user_success": 0, "group_success": 0,
-                "user_failed": 0, "group_failed": 0}
+        return empty
 
     try:
         total_users = await user_collection.count_documents({})
@@ -548,11 +608,9 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
         total = total_users + total_chats
         if not total:
             logger.warning("Broadcast: no recipients found.")
-            return {"total_users": 0, "total_chats": 0,
-                    "user_success": 0, "group_success": 0,
-                    "user_failed": 0, "group_failed": 0}
+            return empty
 
-        semaphore = asyncio.Semaphore(10)
+        semaphore     = asyncio.Semaphore(10)
         sent_count    = 0
         user_success  = 0
         group_success = 0
@@ -575,26 +633,14 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
 
         async def _send(tid, is_group=False):
             nonlocal sent_count, user_success, group_success, user_failed, group_failed
-            success = False
             async with semaphore:
-                for attempt in range(3):
-                    try:
-                        await bot.copy_message(
-                            chat_id=tid, from_chat_id=from_chat_id,
-                            message_id=message_id
-                        )
-                        if is_group:
-                            group_success += 1
-                        else:
-                            user_success += 1
-                        success = True
-                        break
-                    except RetryAfter as e:
-                        await asyncio.sleep(e.retry_after)
-                    except Exception as e:
-                        logger.debug(f"Broadcast: failed for {tid}: {e}")
-                        break
-            if not success:
+                ok = await _deliver_one(bot, tid, from_chat_id, message_id)
+            if ok:
+                if is_group:
+                    group_success += 1
+                else:
+                    user_success += 1
+            else:
                 if is_group:
                     group_failed += 1
                 else:
@@ -617,6 +663,7 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
                         pass
             await asyncio.sleep(0.05)
 
+        # ── Users batch ──
         batch = []
         async for doc in user_collection.find({}, {"user_id": 1}):
             batch.append(doc["user_id"])
@@ -626,6 +673,7 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
         if batch:
             await asyncio.gather(*(_send(uid, False) for uid in batch))
 
+        # ── Groups batch ──
         batch = []
         async for doc in chat_collection.find({}, {"chat_id": 1}):
             batch.append(doc["chat_id"])
@@ -661,11 +709,7 @@ async def smart_post(message_id: int, bot, from_chat_id: int, content_type: str 
 
     except PyMongoError as e:
         logger.error(f"Broadcast DB error: {e}")
-        return {"total_users": 0, "total_chats": 0,
-                "user_success": 0, "group_success": 0,
-                "user_failed": 0, "group_failed": 0}
+        return empty
     except Exception as e:
         logger.error(f"Broadcast unexpected error: {e}")
-        return {"total_users": 0, "total_chats": 0,
-                "user_success": 0, "group_success": 0,
-                "user_failed": 0, "group_failed": 0}
+        return empty
